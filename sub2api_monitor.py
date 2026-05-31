@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 try:
     from zoneinfo import ZoneInfo
@@ -90,6 +90,18 @@ class Config:
         r"network|timeout|timed\s*out|dns|connection\s+(?:reset|refused)|"
         r"client\s+(?:closed|disconnect|cancel)|failed\s+to\s+read\s+request\s+body)"
     )
+    proxy_error_alerts_enabled: bool = True
+    proxy_error_include_regex: str = (
+        r"(?i)(proxy|socks|tunnel|http\s*connect|connect\s*failed|"
+        r"network|timeout|timed\s*out|dns|enotfound|eai_again|"
+        r"connection\s+(?:reset|refused)|econnreset|econnrefused|etimedout|"
+        r"no\s+route|host\s+unreachable|tls|ssl|certificate)"
+    )
+    proxy_error_exclude_regex: str = (
+        r"(?i)(api[\s_-]?key|user\s*key|invalid\s+key|unauthori[sz]ed|"
+        r"forbidden|permission|authentication|invalidated\s+oauth\s+token|"
+        r"failed\s+to\s+read\s+request\s+body|client\s+(?:closed|disconnect|cancel))"
+    )
     daily_report_hour: int = 0
     daily_report_minute: int = 0
     daily_catchup: bool = True
@@ -138,6 +150,9 @@ class Config:
         cfg.error_cooldown_seconds = get_int(merged, "ERROR_COOLDOWN_SECONDS", cfg.error_cooldown_seconds, 0, 86400)
         cfg.upstream_allowed_status_codes = get_str(merged, "UPSTREAM_ALLOWED_STATUS_CODES", cfg.upstream_allowed_status_codes)
         cfg.upstream_exclude_regex = get_str(merged, "UPSTREAM_EXCLUDE_REGEX", cfg.upstream_exclude_regex)
+        cfg.proxy_error_alerts_enabled = get_bool(merged, "PROXY_ERROR_ALERTS_ENABLED", cfg.proxy_error_alerts_enabled)
+        cfg.proxy_error_include_regex = get_str(merged, "PROXY_ERROR_INCLUDE_REGEX", cfg.proxy_error_include_regex)
+        cfg.proxy_error_exclude_regex = get_str(merged, "PROXY_ERROR_EXCLUDE_REGEX", cfg.proxy_error_exclude_regex)
         cfg.daily_report_hour = get_int(merged, "DAILY_REPORT_HOUR", cfg.daily_report_hour, 0, 23)
         cfg.daily_report_minute = get_int(merged, "DAILY_REPORT_MINUTE", cfg.daily_report_minute, 0, 59)
         cfg.daily_catchup = get_bool(merged, "DAILY_CATCHUP", cfg.daily_catchup)
@@ -175,6 +190,8 @@ class Monitor:
         self.state.setdefault("error_cooldowns", {})
         self.allowed_status = parse_allowed_status(self.cfg.upstream_allowed_status_codes)
         self.exclude_re = re.compile(self.cfg.upstream_exclude_regex) if self.cfg.upstream_exclude_regex else None
+        self.proxy_include_re = re.compile(self.cfg.proxy_error_include_regex) if self.cfg.proxy_error_include_regex else None
+        self.proxy_exclude_re = re.compile(self.cfg.proxy_error_exclude_regex) if self.cfg.proxy_error_exclude_regex else None
 
     def save(self) -> None:
         save_state(Path(self.cfg.state_file), self.state)
@@ -529,14 +546,35 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
             return False
         return True
 
+    def is_actionable_proxy_error(self, row: dict[str, Any]) -> bool:
+        if not self.cfg.proxy_error_alerts_enabled:
+            return False
+        if row.get("is_business_limited") is True:
+            return False
+        if row.get("error_owner") == "client":
+            return False
+        source = str(row.get("error_source") or "")
+        message = str(row.get("message") or "")
+        network_type = str(row.get("network_error_type") or "")
+        haystack = " ".join([message, network_type, str(row.get("error_type") or ""), str(row.get("provider_error_type") or "")])
+        if self.proxy_exclude_re and self.proxy_exclude_re.search(haystack):
+            return False
+        if source and not source.startswith("upstream") and not network_type:
+            return False
+        if network_type:
+            return True
+        return bool(self.proxy_include_re and self.proxy_include_re.search(haystack))
+
     def check_upstream_errors(self) -> str | None:
         rows = self.fetch_new_error_rows()
         if not rows:
             return None
         max_id = max(int(r.get("id") or 0) for r in rows)
-        actionable = [r for r in rows if self.is_actionable_upstream_error(r)]
+        proxy_errors = [r for r in rows if self.is_actionable_proxy_error(r)]
+        proxy_error_ids = {int(r.get("id") or 0) for r in proxy_errors}
+        upstream_errors = [r for r in rows if int(r.get("id") or 0) not in proxy_error_ids and self.is_actionable_upstream_error(r)]
         self.state["last_error_id"] = max(max_id, int(self.state.get("last_error_id") or 0))
-        if not actionable:
+        if not upstream_errors and not proxy_errors:
             return None
 
         cooldowns: dict[str, Any] = self.state.setdefault("error_cooldowns", {})
@@ -549,24 +587,22 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
             except Exception:
                 cooldowns.pop(key, None)
 
-        grouped: dict[str, dict[str, Any]] = {}
-        suppressed = 0
-        for row in actionable:
-            key = error_key(row)
-            if key not in grouped:
-                if self.cfg.error_cooldown_seconds > 0 and key in cooldowns:
-                    suppressed += 1
-                    continue
-                if self.cfg.error_cooldown_seconds > 0:
-                    cooldowns[key] = now_ts + self.cfg.error_cooldown_seconds
-            g = grouped.setdefault(key, {"count": 0, "rows": [], "sample": row})
-            g["count"] += 1
-            g["rows"].append(row)
+        upstream_grouped, upstream_suppressed = group_error_rows(
+            upstream_errors, cooldowns, now_ts, self.cfg.error_cooldown_seconds, error_key, "upstream"
+        )
+        proxy_grouped, proxy_suppressed = group_error_rows(
+            proxy_errors, cooldowns, now_ts, self.cfg.error_cooldown_seconds, proxy_error_key, "proxy"
+        )
 
-        if not grouped:
-            logging.info("upstream errors suppressed by cooldown: %s", suppressed)
+        messages = []
+        if upstream_grouped:
+            messages.append(build_error_message(upstream_grouped, upstream_suppressed, self.cfg))
+        if proxy_grouped:
+            messages.append(build_proxy_error_message(proxy_grouped, proxy_suppressed, self.cfg))
+        if not messages:
+            logging.info("ops errors suppressed by cooldown: upstream=%s proxy=%s", upstream_suppressed, proxy_suppressed)
             return None
-        return build_error_message(grouped, suppressed, self.cfg)
+        return "\n\n".join(messages)
 
     def maybe_daily_report(self) -> str | None:
         tz = self.cfg.tzinfo()
@@ -941,6 +977,30 @@ def display_identifier(row: dict[str, Any], cfg: Config) -> str:
     return raw
 
 
+def group_error_rows(
+    rows: list[dict[str, Any]],
+    cooldowns: dict[str, Any],
+    now_ts: int,
+    cooldown_seconds: int,
+    key_func: Callable[[dict[str, Any]], str],
+    namespace: str,
+) -> tuple[dict[str, dict[str, Any]], int]:
+    grouped: dict[str, dict[str, Any]] = {}
+    suppressed = 0
+    for row in rows:
+        key = f"{namespace}:{key_func(row)}"
+        if key not in grouped:
+            if cooldown_seconds > 0 and key in cooldowns:
+                suppressed += 1
+                continue
+            if cooldown_seconds > 0:
+                cooldowns[key] = now_ts + cooldown_seconds
+        g = grouped.setdefault(key, {"count": 0, "rows": [], "sample": row})
+        g["count"] += 1
+        g["rows"].append(row)
+    return grouped, suppressed
+
+
 def build_error_message(grouped: dict[str, dict[str, Any]], suppressed: int, cfg: Config) -> str:
     total = sum(int(g["count"]) for g in grouped.values())
     lines = [
@@ -961,6 +1021,37 @@ def build_error_message(grouped: dict[str, dict[str, Any]], suppressed: int, cfg
             f"{tg_code(str(status))} ×{int(group['count'])}"
         )
         lines.append(f"  {h(msg)}" + (f" · {tg_code('ids ' + ids)}" if ids else ""))
+    if len(grouped) > cfg.detail_limit:
+        lines.append(muted(f"另有 {len(grouped) - cfg.detail_limit} 组未展开"))
+    return clamp_message("\n".join(lines))
+
+
+def build_proxy_error_message(grouped: dict[str, dict[str, Any]], suppressed: int, cfg: Config) -> str:
+    total = sum(int(g["count"]) for g in grouped.values())
+    lines = [
+        "🌐 <b>Sub2API 出口/网络错误</b>",
+        muted(now_iso(cfg.tzinfo())),
+        h(f"新增 {total} 条 / {len(grouped)} 组") + (h(f" · 冷却抑制 {suppressed} 条") if suppressed else ""),
+        "",
+        section("错误分组"),
+    ]
+    for group in sorted(grouped.values(), key=lambda g: -int(g["count"]))[: cfg.detail_limit]:
+        sample = group["sample"]
+        model = sample.get("model") or "unknown-model"
+        kind = sample.get("network_error_type") or sample.get("error_type") or sample.get("upstream_status_code") or sample.get("status_code") or "network"
+        msg = truncate(re.sub(r"\s+", " ", str(sample.get("message") or "")).strip(), 120)
+        ids = ",".join(str(r.get("id")) for r in group.get("rows", [])[:5])
+        account_ids = sorted({str(r.get("account_id")) for r in group.get("rows", []) if r.get("account_id")})[:5]
+        suffix = []
+        if account_ids:
+            suffix.append("accounts " + ",".join("#" + x for x in account_ids))
+        if ids:
+            suffix.append("ids " + ids)
+        lines.append(
+            f"🟠 {tg_code(str(sample.get('platform') or 'unknown') + '/' + str(model))} "
+            f"{tg_code(str(kind))} ×{int(group['count'])}"
+        )
+        lines.append(f"  {h(msg)}" + (f" · {tg_code(' · '.join(suffix))}" if suffix else ""))
     if len(grouped) > cfg.detail_limit:
         lines.append(muted(f"另有 {len(grouped) - cfg.detail_limit} 组未展开"))
     return clamp_message("\n".join(lines))
@@ -1045,6 +1136,23 @@ def error_key(row: dict[str, Any]) -> str:
             row.get("error_type"),
             row.get("provider_error_type"),
             row.get("provider_error_code"),
+            msg,
+        )
+    )
+    return stable_hash(raw)
+
+
+def proxy_error_key(row: dict[str, Any]) -> str:
+    msg = re.sub(r"\s+", " ", str(row.get("message") or "")).strip().lower()[:160]
+    raw = "|".join(
+        str(x or "")
+        for x in (
+            row.get("platform"),
+            row.get("model"),
+            row.get("network_error_type"),
+            row.get("error_type"),
+            row.get("provider_error_type"),
+            row.get("upstream_endpoint"),
             msg,
         )
     )

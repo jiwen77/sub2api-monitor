@@ -228,6 +228,7 @@ print_config_summary() {
   echo "同类错误冷却时间: $(get_env_value ERROR_COOLDOWN_SECONDS 600) 秒"
   echo "告警状态码: $(get_env_value UPSTREAM_ALLOWED_STATUS_CODES '429,500-599')"
   echo "首次启动告警历史错误: $(get_env_value ALERT_EXISTING_ERRORS_ON_FIRST_RUN false)"
+  echo "出口/网络错误告警: $(get_env_value PROXY_ERROR_ALERTS_ENABLED true)"
   local daily_hour daily_minute
   daily_hour=$(get_env_value DAILY_REPORT_HOUR 0)
   daily_minute=$(get_env_value DAILY_REPORT_MINUTE 0)
@@ -302,6 +303,7 @@ configure_runtime_options() {
         prompt_int ERROR_COOLDOWN_SECONDS "同类错误冷却时间，避免刷屏；0 表示不冷却" 600 0 86400
         prompt_text UPSTREAM_ALLOWED_STATUS_CODES "哪些上游 HTTP 状态码会告警，例如 429,500-599" "429,500-599"
         prompt_bool ALERT_EXISTING_ERRORS_ON_FIRST_RUN "首次启动是否告警历史错误；通常建议 false" false
+        prompt_bool PROXY_ERROR_ALERTS_ENABLED "是否单独告警出口代理/DNS/连接超时等网络错误" true
         ;;
       6)
         prompt_int DAILY_REPORT_HOUR "日报发送小时" 0 0 23

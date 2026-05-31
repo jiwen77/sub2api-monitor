@@ -13,10 +13,11 @@ A passive monitoring and Telegram alerting tool for [Sub2API](https://github.com
   - Reports state changes for active/error/rate-limited/overloaded/temporarily-unschedulable/expired accounts.
   - Redacts account identifiers by default.
 
-- **Upstream error alerts**
+- **Upstream and exit-network error alerts**
   - Reads Sub2API `ops_error_logs`.
   - Defaults to provider/upstream `429` and `5xx` alerts.
-  - Filters out common client-side, API-key, authentication, request-body, and network-looking errors.
+  - Separately alerts likely exit-proxy/network failures such as proxy tunnel, DNS, timeout, TLS, connection reset/refused.
+  - Filters out common client-side, API-key, authentication, and request-body errors.
 
 - **Readable Telegram cards**
   - Uses compact lines, emoji severity hints, bold section headers, and shortened error summaries.
@@ -131,6 +132,13 @@ Most users start with options 1-5 and 10; use option 13 when you want guided con
 | 14 | Manually edit config file | Opens `/etc/sub2api-monitor/config.env` in `nano` or `$EDITOR`. |
 | 15 | Uninstall program files | Keeps config/state by default. |
 
+
+## Error alert categories
+
+`Sub2API 上游错误` means the provider/upstream appears to have returned an actionable `429` or `5xx` response. Network-looking errors are excluded from this category.
+
+`Sub2API 出口/网络错误` means the request appears to have failed before reaching the provider successfully, for example proxy tunnel failures, DNS errors, timeout, TLS/certificate errors, or connection reset/refused. This category is useful when an account's configured exit proxy is down.
+
 ## Telegram commands
 
 When the systemd service or `daemon` command is running, the bot can also receive commands from Telegram. The monitor registers the command list with Telegram automatically on startup and when you run `测试 Telegram 通知`, so typing `/` in the chat can show command completions.
@@ -205,6 +213,7 @@ Important options:
 | `ERROR_LOOKBACK_MINUTES` | `30` | Lookback window for new upstream errors. |
 | `ERROR_COOLDOWN_SECONDS` | `600` | Per-error-group cooldown. |
 | `UPSTREAM_ALLOWED_STATUS_CODES` | `429,500-599` | Upstream HTTP statuses that should alert. |
+| `PROXY_ERROR_ALERTS_ENABLED` | `true` | Separately alert likely exit-proxy/network failures from `ops_error_logs`. |
 | `REDACT_IDENTIFIERS` | `true` | Redact account names/emails in alerts. |
 | `DAILY_REPORT_HOUR` | `0` | Local hour for daily report. |
 | `DAILY_REPORT_MINUTE` | `0` | Local minute for daily report. |

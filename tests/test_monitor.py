@@ -30,6 +30,56 @@ class PredicateTests(unittest.TestCase):
         row = dict(base, error_owner="client")
         self.assertFalse(mon.is_actionable_upstream_error(row))
 
+
+    def test_proxy_error_detects_network_and_proxy_failures(self):
+        cfg = m.Config()
+        mon = m.Monitor(cfg, dry_run=True)
+        base = {
+            "id": 1,
+            "error_owner": "provider",
+            "error_source": "upstream_http",
+            "network_error_type": "",
+            "is_business_limited": False,
+            "status_code": None,
+            "upstream_status_code": None,
+            "message": "proxy CONNECT failed: ECONNREFUSED",
+        }
+        self.assertTrue(mon.is_actionable_proxy_error(dict(base)))
+        row = dict(base, message="plain provider 503", upstream_status_code=503)
+        self.assertFalse(mon.is_actionable_proxy_error(row))
+        row = dict(base, network_error_type="timeout", message="request timed out")
+        self.assertTrue(mon.is_actionable_proxy_error(row))
+        row = dict(base, error_owner="client", network_error_type="timeout", message="client timeout")
+        self.assertFalse(mon.is_actionable_proxy_error(row))
+        row = dict(base, message="invalid api key timeout")
+        self.assertFalse(mon.is_actionable_proxy_error(row))
+
+    def test_proxy_error_message_groups_account_ids(self):
+        cfg = m.Config()
+        grouped = {
+            "proxy:x": {
+                "count": 2,
+                "sample": {
+                    "id": 10,
+                    "platform": "openai",
+                    "model": "gpt-test",
+                    "network_error_type": "proxy_connect",
+                    "message": "proxy CONNECT failed",
+                    "account_id": 101,
+                },
+                "rows": [
+                    {"id": 10, "account_id": 101},
+                    {"id": 11, "account_id": 102},
+                ],
+            }
+        }
+        message = m.build_proxy_error_message(grouped, 0, cfg)
+        self.assertIn("出口/网络错误", message)
+        self.assertIn("openai/gpt-test", message)
+        self.assertIn("proxy_connect", message)
+        self.assertIn("accounts #101,#102", message)
+        self.assertIn("ids 10,11", message)
+
     def test_account_digest_ignores_usage_percent(self):
         row = {
             "id": 1,
