@@ -460,7 +460,16 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
                 changed.append(row)
         if not added and not removed and not changed:
             return None
-        return build_account_message(rows, changed, added, removed, self.cfg, title="🔔 sub2api 账号状态变化")
+        return build_account_message(
+            rows,
+            changed,
+            added,
+            removed,
+            self.cfg,
+            title="🔔 sub2api 账号状态变化",
+            include_summary=False,
+            include_abnormal=False,
+        )
 
     def max_ops_error_id(self) -> int:
         sql = "SELECT coalesce(max(id),0)::bigint FROM ops_error_logs;"
@@ -707,16 +716,18 @@ def build_account_message(
     removed: list[dict[str, Any]],
     cfg: Config,
     title: str,
+    include_summary: bool = True,
+    include_abnormal: bool = True,
 ) -> str:
     _summary_lines, buckets = summarize_accounts(rows)
     lines = [
         f"{h(title)}",
         muted(now_iso(cfg.tzinfo())),
-        "",
-        section("账号概览"),
     ]
-    for key, bucket in sorted(buckets.items()):
-        lines.append(format_summary_line(key, bucket, html_mode=True))
+    if include_summary:
+        lines += ["", section("账号概览")]
+        for key, bucket in sorted(buckets.items()):
+            lines.append(format_summary_line(key, bucket, html_mode=True))
 
     abnormal = sorted([r for r in rows if not r.get("normal")], key=account_sort_key)
     if changed or added or removed:
@@ -744,7 +755,7 @@ def build_account_message(
         if total_changes > shown:
             lines.append(muted(f"另有 {total_changes - shown} 条变化未展开"))
 
-    if abnormal:
+    if include_abnormal and abnormal:
         lines += ["", section("当前需要关注（非正常账号）")]
         for row in abnormal[: cfg.detail_limit]:
             lines.append(format_account_row(row, cfg))

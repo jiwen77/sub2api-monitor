@@ -108,6 +108,62 @@ class PredicateTests(unittest.TestCase):
         self.assertEqual(commands, m.TELEGRAM_BOT_COMMANDS)
         self.assertEqual(timeout_seconds, 20)
 
+    def test_change_alert_can_hide_summary_and_abnormal_list(self):
+        cfg = m.Config()
+        changed = {
+            "id": 108,
+            "platform": "openai",
+            "type": "oauth",
+            "plan": "plus",
+            "status": "active",
+            "normal": True,
+            "schedulable": True,
+            "rate_limited": False,
+            "overloaded": False,
+            "temp_unschedulable": False,
+            "expired": False,
+            "email": "new@example.com",
+            "_previous": {
+                "id": 108,
+                "platform": "openai",
+                "type": "oauth",
+                "plan": "plus",
+                "status": "active",
+                "normal": False,
+                "schedulable": True,
+                "rate_limited": True,
+                "rate_limit_reset_at": "2026-06-05 12:49:00+00",
+            },
+        }
+        abnormal = {
+            "id": 101,
+            "platform": "openai",
+            "type": "oauth",
+            "plan": "plus",
+            "status": "error",
+            "normal": False,
+            "schedulable": True,
+            "rate_limited": False,
+            "error_message": "Token revoked (401)",
+        }
+
+        message = m.build_account_message(
+            [changed, abnormal],
+            [changed],
+            [],
+            [],
+            cfg,
+            title="test",
+            include_summary=False,
+            include_abnormal=False,
+        )
+
+        self.assertIn("本次变化", message)
+        self.assertIn("#108", message)
+        self.assertNotIn("账号概览", message)
+        self.assertNotIn("当前需要关注", message)
+        self.assertNotIn("#101", message)
+
 
 if __name__ == "__main__":
     unittest.main()

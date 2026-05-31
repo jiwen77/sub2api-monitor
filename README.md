@@ -9,6 +9,7 @@ A passive monitoring and Telegram alerting tool for [Sub2API](https://github.com
 - **Account status alerts**
   - Summarizes accounts by `platform/plan`, for example `openai/free: normal 2/2`.
   - Can send the current account status on demand, even when nothing changed.
+  - Automatic change alerts only show the accounts that changed, so old abnormalities are not repeated every time.
   - Reports state changes for active/error/rate-limited/overloaded/temporarily-unschedulable/expired accounts.
   - Redacts account identifiers by default.
 
