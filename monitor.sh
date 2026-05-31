@@ -187,15 +187,16 @@ menu() {
     echo " 2) 配置 Telegram"
     echo " 3) 发送 Telegram 测试"
     echo " 4) 查看当前账号状态（不通知）"
-    echo " 5) 执行一次监控并通知"
-    echo " 6) 生成日报（不通知）"
-    echo " 7) 立即发送日报"
-    echo " 8) 前台运行 daemon"
-    echo " 9) 安装并启动 systemd 服务"
-    echo "10) 查看服务状态/日志"
-    echo "11) 停止并禁用服务"
-    echo "12) 编辑配置"
-    echo "13) 卸载程序文件"
+    echo " 5) 发送当前账号状态到 Telegram"
+    echo " 6) 执行一次监控并通知"
+    echo " 7) 生成日报（不通知）"
+    echo " 8) 立即发送日报"
+    echo " 9) 前台运行 daemon"
+    echo "10) 安装并启动 systemd 服务"
+    echo "11) 查看服务状态/日志"
+    echo "12) 停止并禁用服务"
+    echo "13) 编辑配置"
+    echo "14) 卸载程序文件"
     echo " 0) 退出"
     echo
     read -r -p "请选择: " choice
@@ -204,15 +205,16 @@ menu() {
       2) configure_tg; pause ;;
       3) run_py test-telegram; pause ;;
       4) run_py account-summary; pause ;;
-      5) run_py run-once --notify; pause ;;
-      6) run_py daily; pause ;;
-      7) run_py daily --notify; pause ;;
-      8) run_py daemon ;;
-      9) install_service; pause ;;
-      10) show_status; pause ;;
-      11) stop_service; pause ;;
-      12) edit_config; pause ;;
-      13) uninstall_monitor; pause ;;
+      5) run_py account-summary --notify; pause ;;
+      6) run_py run-once --notify; pause ;;
+      7) run_py daily; pause ;;
+      8) run_py daily --notify; pause ;;
+      9) run_py daemon ;;
+      10) install_service; pause ;;
+      11) show_status; pause ;;
+      12) stop_service; pause ;;
+      13) edit_config; pause ;;
+      14) uninstall_monitor; pause ;;
       0) exit 0 ;;
       *) echo -e "${red}无效选择${reset}"; sleep 1 ;;
     esac

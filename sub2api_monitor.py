@@ -1109,7 +1109,8 @@ def build_parser() -> argparse.ArgumentParser:
     once = sub.add_parser("run-once", help="run account + upstream checks once")
     once.add_argument("--notify", action="store_true", help="send Telegram if there are messages")
     once.add_argument("--no-daily", action="store_true", help="skip daily report scheduler")
-    sub.add_parser("account-summary", help="print current account summary")
+    account = sub.add_parser("account-summary", help="print/send current account summary")
+    account.add_argument("--notify", action="store_true", help="send current account summary to Telegram")
     daily = sub.add_parser("daily", help="build/send a daily report")
     daily.add_argument("--date", help="YYYY-MM-DD local day to report; default yesterday")
     daily.add_argument("--notify", action="store_true")
@@ -1136,7 +1137,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "account-summary":
         rows = mon.current_account_rows()
         msg = build_account_message(rows, [], [], [], cfg, title="ℹ️ sub2api 当前账号状态")
-        print(render_for_terminal(msg))
+        if args.notify:
+            mon.send(msg)
+        else:
+            print(render_for_terminal(msg))
         return 0
     if args.command == "daily":
         tz = cfg.tzinfo()

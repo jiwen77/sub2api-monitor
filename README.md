@@ -8,6 +8,7 @@ A passive monitoring and Telegram alerting tool for [Sub2API](https://github.com
 
 - **Account status alerts**
   - Summarizes accounts by `platform/plan`, for example `openai/free: normal 2/2`.
+  - Can send the current account status on demand, even when nothing changed.
   - Reports state changes for active/error/rate-limited/overloaded/temporarily-unschedulable/expired accounts.
   - Redacts account identifiers by default.
 
@@ -60,7 +61,8 @@ Recommended first-run flow:
 2. `配置 Telegram`
 3. `发送 Telegram 测试`
 4. `查看当前账号状态（不通知）`
-5. `安装并启动 systemd 服务`
+5. `发送当前账号状态到 Telegram`
+6. `安装并启动 systemd 服务`
 
 After installation, open the menu with:
 
@@ -102,6 +104,7 @@ sudo UPDATE_REPO_URL=https://github.com/yourname/sub2api-monitor.git \
 
 ```bash
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env account-summary
+python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env account-summary --notify
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env run-once --notify
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env daily --notify
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env daemon
