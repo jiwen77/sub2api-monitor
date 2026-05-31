@@ -66,7 +66,7 @@ Recommended first-run flow:
 2. `配置 Telegram`
 3. `发送 Telegram 测试`
 4. `查看当前账号状态（不通知）`
-5. `发送当前账号状态到 Telegram`
+5. `强制推送当前账号状态快照`
 6. `安装并启动 systemd 服务`
 
 After installation, open the menu with:
@@ -106,6 +106,12 @@ sudo UPDATE_REPO_URL=https://github.com/yourname/sub2api-monitor.git \
 ```
 
 
+
+## Menu option 5 vs 6
+
+- Option 5, `强制推送当前账号状态快照`: always sends the current account summary to Telegram. Use it when you just want to look at the current account state.
+- Option 6, `手动巡检一次（仅变化/上游错误才告警）`: runs one normal monitoring cycle. It sends Telegram only when account state changed or a qualifying upstream error is found. Use it to test the alerting rules without starting the daemon.
+
 ## Telegram commands
 
 When the systemd service or `daemon` command is running, the bot can also receive commands from Telegram:
@@ -129,10 +135,19 @@ The daemon drops pending Telegram updates on first startup by default so old `/s
 ## Manual commands
 
 ```bash
+# Print the current account snapshot without sending Telegram.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env account-summary
+
+# Force-send the current account snapshot to Telegram.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env account-summary --notify
+
+# Run the same alert rules once: account changes and upstream errors only.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env run-once --notify
+
+# Force-send the daily usage report.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env daily --notify
+
+# Keep monitoring in the foreground.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env daemon
 ```
 
