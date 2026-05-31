@@ -137,6 +137,11 @@ configure_tg() {
     set_env_value "SEND_STARTUP_SUMMARY" "true" "$CONFIG_FILE"
   fi
   echo -e "${green}Telegram 配置已保存。${reset}"
+  if run_py setup-telegram-commands; then
+    echo -e "${green}Telegram 输入补全命令已注册。${reset}"
+  else
+    echo -e "${yellow}Telegram 输入补全命令注册失败；通知配置仍已保存。${reset}"
+  fi
 }
 
 

@@ -28,6 +28,7 @@ A passive monitoring and Telegram alerting tool for [Sub2API](https://github.com
 - **Telegram bot commands**
   - While the daemon is running, send `/status` to receive the current account status immediately.
   - Supports `/daily`, `/ping`, and `/help`.
+  - Registers Telegram slash-command suggestions with `setMyCommands` so typing `/` can show completions.
   - Only authorized chat IDs are served.
 
 - **Interactive management script**
@@ -131,7 +132,7 @@ Most users start with options 1-5 and 10; use option 13 when you want guided con
 
 ## Telegram commands
 
-When the systemd service or `daemon` command is running, the bot can also receive commands from Telegram:
+When the systemd service or `daemon` command is running, the bot can also receive commands from Telegram. The monitor registers the command list with Telegram automatically on startup and when you run `测试 Telegram 通知`, so typing `/` in the chat can show command completions.
 
 | Command | Description |
 | --- | --- |
@@ -163,6 +164,9 @@ python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/co
 
 # Force-send the daily usage report.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env daily --notify
+
+# Register Telegram slash-command suggestions.
+python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env setup-telegram-commands
 
 # Keep monitoring in the foreground.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env daemon

@@ -81,6 +81,33 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("当前用量：5h 100.0% · 7d 46.0%", message)
         self.assertNotIn("当前需要关注", message)
 
+    def test_telegram_bot_commands_are_valid_for_api(self):
+        for command in m.TELEGRAM_BOT_COMMANDS:
+            self.assertRegex(command["command"], r"^[a-z0-9_]{1,32}$")
+            self.assertGreaterEqual(len(command["description"]), 1)
+            self.assertLessEqual(len(command["description"]), 256)
+
+    def test_set_telegram_bot_commands_payload(self):
+        calls = []
+        original = m.telegram_api_request
+
+        def fake_request(cfg, method, payload, timeout_seconds=20):
+            calls.append((method, payload, timeout_seconds))
+            return {"ok": True, "result": True}
+
+        try:
+            m.telegram_api_request = fake_request
+            m.set_telegram_bot_commands(m.Config(telegram_bot_token="123:token"))
+        finally:
+            m.telegram_api_request = original
+
+        self.assertEqual(len(calls), 1)
+        method, payload, timeout_seconds = calls[0]
+        self.assertEqual(method, "setMyCommands")
+        commands = m.json.loads(payload["commands"])
+        self.assertEqual(commands, m.TELEGRAM_BOT_COMMANDS)
+        self.assertEqual(timeout_seconds, 20)
+
 
 if __name__ == "__main__":
     unittest.main()

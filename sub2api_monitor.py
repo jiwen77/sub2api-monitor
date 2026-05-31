@@ -34,6 +34,13 @@ except Exception:  # pragma: no cover
     ZoneInfo = None  # type: ignore
 
 APP_NAME = "sub2api-monitor"
+
+TELEGRAM_BOT_COMMANDS = [
+    {"command": "status", "description": "当前账号状态"},
+    {"command": "daily", "description": "昨日/今日用量日报"},
+    {"command": "ping", "description": "检查 bot 是否在线"},
+    {"command": "help", "description": "显示帮助"},
+]
 DEFAULT_CONFIG_PATHS = (
     "/etc/sub2api-monitor/config.env",
     "/opt/sub2api-monitor/config.env",
@@ -223,6 +230,7 @@ class Monitor:
             self.telegram_commands_active(),
             self.cfg.config_path,
         )
+        self.register_telegram_bot_commands()
         # Establish a baseline immediately; notify only when configured.
         self.run_once(notify=True, include_daily=True)
         self.bootstrap_telegram_commands()
@@ -251,6 +259,14 @@ class Monitor:
 
     def telegram_commands_active(self) -> bool:
         return bool(self.cfg.telegram_commands_enabled and self.cfg.telegram_bot_token)
+
+    def register_telegram_bot_commands(self) -> None:
+        if not self.telegram_commands_active():
+            return
+        try:
+            set_telegram_bot_commands(self.cfg, dry_run=self.dry_run)
+        except Exception:
+            logging.exception("failed to register telegram bot commands")
 
     def bootstrap_telegram_commands(self) -> None:
         if not self.telegram_commands_active():
@@ -1052,6 +1068,18 @@ def send_telegram(cfg: Config, text: str, dry_run: bool = False, chat_id: str | 
             raise
 
 
+def set_telegram_bot_commands(cfg: Config, dry_run: bool = False) -> None:
+    if dry_run or not cfg.telegram_bot_token:
+        prefix = "[dry-run telegram commands]" if dry_run else "[telegram disabled: missing TELEGRAM_BOT_TOKEN]"
+        print(prefix)
+        for command in TELEGRAM_BOT_COMMANDS:
+            print(f"/{command['command']} - {command['description']}")
+        return
+    payload = {"commands": json.dumps(TELEGRAM_BOT_COMMANDS, ensure_ascii=False)}
+    telegram_api_request(cfg, "setMyCommands", payload, timeout_seconds=20)
+    logging.info("telegram bot commands registered: %s", ",".join("/" + c["command"] for c in TELEGRAM_BOT_COMMANDS))
+
+
 def telegram_get_updates(cfg: Config, offset: int | None, timeout_seconds: int = 0) -> list[dict[str, Any]]:
     payload: dict[str, Any] = {
         "timeout": str(max(0, int(timeout_seconds))),
@@ -1099,14 +1127,10 @@ def telegram_chat_allowed(cfg: Config, chat_id: str) -> bool:
 
 
 def build_command_help() -> str:
-    return "\n".join([
-        "🤖 <b>Sub2API Monitor</b>",
-        "",
-        f"{tg_code('/status')} 当前账号状态",
-        f"{tg_code('/daily')} 昨日/今日用量日报",
-        f"{tg_code('/ping')} 检查 bot 是否在线",
-        f"{tg_code('/help')} 显示帮助",
-    ])
+    lines = ["🤖 <b>Sub2API Monitor</b>", ""]
+    for command in TELEGRAM_BOT_COMMANDS:
+        lines.append(f"{tg_code('/' + command['command'])} {h(command['description'])}")
+    return "\n".join(lines)
 
 
 def build_unknown_command(command: str) -> str:
@@ -1335,6 +1359,7 @@ def build_parser() -> argparse.ArgumentParser:
     daily.add_argument("--date", help="YYYY-MM-DD local day to report; default yesterday")
     daily.add_argument("--notify", action="store_true")
     sub.add_parser("test-telegram", help="send a Telegram test message")
+    sub.add_parser("setup-telegram-commands", help="register Telegram slash-command menu")
     sub.add_parser("inspect", help="print current config/state paths and account summary JSON")
     return p
 
@@ -1375,7 +1400,12 @@ def main(argv: list[str] | None = None) -> int:
             print(render_for_terminal(msg))
         return 0
     if args.command == "test-telegram":
+        set_telegram_bot_commands(cfg, dry_run=args.dry_run)
         mon.send(f"✅ {APP_NAME} Telegram 测试成功\n时间：{now_iso(cfg.tzinfo())}")
+        return 0
+    if args.command == "setup-telegram-commands":
+        set_telegram_bot_commands(cfg, dry_run=args.dry_run)
+        print("Telegram 命令菜单已注册。")
         return 0
     if args.command == "inspect":
         rows = mon.current_account_rows()
