@@ -47,6 +47,40 @@ class PredicateTests(unittest.TestCase):
         b = m.account_digest(row)
         self.assertEqual(a, b)
 
+    def test_account_change_message_shows_before_after(self):
+        cfg = m.Config()
+        current = {
+            "id": 104,
+            "platform": "openai",
+            "type": "oauth",
+            "plan": "plus",
+            "status": "active",
+            "normal": True,
+            "schedulable": True,
+            "rate_limited": False,
+            "overloaded": False,
+            "temp_unschedulable": False,
+            "expired": False,
+            "email": "someone@example.com",
+            "codex_5h_used_percent": 100.0,
+            "codex_7d_used_percent": 46.0,
+        }
+        previous = dict(current)
+        previous.update({
+            "normal": False,
+            "rate_limited": True,
+            "rate_limit_reset_at": "2026-06-05 12:49:00+00",
+        })
+        changed = dict(current)
+        changed["_previous"] = m.account_digest(previous)
+
+        message = m.build_account_message([current], [changed], [], [], cfg, title="test")
+
+        self.assertIn("本次变化", message)
+        self.assertIn("状态：限流至 06-05 12:49 → 正常", message)
+        self.assertIn("当前用量：5h 100.0% · 7d 46.0%", message)
+        self.assertNotIn("当前需要关注", message)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -444,7 +444,7 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
                 changed.append(row)
         if not added and not removed and not changed:
             return None
-        return build_account_message(rows, changed, added, removed, self.cfg, title="🔔 sub2api 账号状态变更")
+        return build_account_message(rows, changed, added, removed, self.cfg, title="🔔 sub2api 账号状态变化")
 
     def max_ops_error_id(self) -> int:
         sql = "SELECT coalesce(max(id),0)::bigint FROM ops_error_logs;"
@@ -704,16 +704,24 @@ def build_account_message(
 
     abnormal = sorted([r for r in rows if not r.get("normal")], key=account_sort_key)
     if changed or added or removed:
-        lines += ["", section(f"变化 · {len(changed)} 变更 / {len(added)} 新增 / {len(removed)} 移除")]
+        lines += [
+            "",
+            section("本次变化（上一轮 → 当前）"),
+            h(f"{len(changed)} 个变更 / {len(added)} 个新增 / {len(removed)} 个移除"),
+        ]
         shown = 0
-        for label, icon, items in (("变更", "🔄", changed), ("新增", "➕", added)):
-            for row in items[: cfg.detail_limit]:
-                lines.append(format_account_row(row, cfg, prefix=f"{icon} {label}"))
-                shown += 1
+        for row in changed[: cfg.detail_limit]:
+            lines.append(format_account_change_row(row, cfg))
+            shown += 1
+        for row in added[: cfg.detail_limit]:
+            lines.append(format_account_row(row, cfg, prefix="➕ 新增"))
+            shown += 1
         for old in removed[: cfg.detail_limit]:
+            previous_state = describe_account_state(old, include_error=False)
             lines.append(
-                f"➖ 移除 {tg_code('#' + str(old.get('id')))} "
+                f"➖ {h('移除')} {tg_code('#' + str(old.get('id')))} "
                 f"{tg_code(str(old.get('platform') or 'unknown') + '/' + str(old.get('plan') or 'unknown'))}"
+                f"\n  {h('移除前：')} {h(previous_state)}"
             )
             shown += 1
         total_changes = len(changed) + len(added) + len(removed)
@@ -721,7 +729,7 @@ def build_account_message(
             lines.append(muted(f"另有 {total_changes - shown} 条变化未展开"))
 
     if abnormal:
-        lines += ["", section("需要关注")]
+        lines += ["", section("当前需要关注（非正常账号）")]
         for row in abnormal[: cfg.detail_limit]:
             lines.append(format_account_row(row, cfg))
         if len(abnormal) > cfg.detail_limit:
@@ -795,6 +803,42 @@ def format_account_row(row: dict[str, Any], cfg: Config, prefix: str = "") -> st
     return " ".join(head_bits) + "\n  " + h(" · ").join(second_bits)
 
 
+
+def format_account_change_row(row: dict[str, Any], cfg: Config) -> str:
+    previous = row.get("_previous") or {}
+    icon = account_icon(row)
+    label = f"{row.get('platform') or 'unknown'}/{row.get('plan') or 'unknown'}"
+    ident = tg_code(f"#{row.get('id')}")
+    name = display_identifier(row, cfg)
+    head_bits = ["🔄", icon, ident]
+    if name:
+        head_bits.append(h(name))
+    head_bits.append(tg_code(label))
+
+    details: list[str] = []
+    old_label = f"{previous.get('platform') or 'unknown'}/{previous.get('plan') or 'unknown'}"
+    if old_label != label:
+        details.append(f"分组：{old_label} → {label}")
+    old_type = str(previous.get("type") or "")
+    new_type = str(row.get("type") or "")
+    if old_type and new_type and old_type != new_type:
+        details.append(f"类型：{old_type} → {new_type}")
+
+    before = describe_account_state(previous, include_error=False)
+    after = describe_account_state(row, include_error=True)
+    if before != after:
+        details.append(f"状态：{before} → {after}")
+    elif previous.get("error_message_hash") and previous.get("error_message_hash") != account_digest(row).get("error_message_hash"):
+        details.append(f"状态：{before} → {after}（错误详情变化）")
+    elif not details:
+        details.append(f"状态细节更新：{after}")
+
+    quota = plain_account_quota_summary(row)
+    if quota:
+        details.append(f"当前用量：{quota}")
+
+    return " ".join(head_bits) + "\n  " + "\n  ".join(h(detail) for detail in details)
+
 def account_icon(row: dict[str, Any]) -> str:
     if row.get("status") not in ("active", ""):
         return "🔴"
@@ -808,32 +852,40 @@ def account_icon(row: dict[str, Any]) -> str:
 
 
 def account_state_summary(row: dict[str, Any]) -> str:
+    return h(describe_account_state(row, include_error=True))
+
+
+def describe_account_state(row: dict[str, Any], include_error: bool = True) -> str:
     if row.get("status") not in ("active", ""):
-        err = clean_account_error(str(row.get("error_message") or ""))
-        return h(f"异常：{row.get('status') or 'unknown'}" + (f" · {err}" if err else ""))
+        err = clean_account_error(str(row.get("error_message") or "")) if include_error else ""
+        return f"异常：{row.get('status') or 'unknown'}" + (f" · {err}" if err else "")
     if row.get("rate_limited"):
-        return h(f"限流至 {short_time(row.get('rate_limit_reset_at'))}")
+        return f"限流至 {short_time(row.get('rate_limit_reset_at'))}"
     if row.get("overloaded"):
-        return h(f"过载至 {short_time(row.get('overload_until'))}")
+        return f"过载至 {short_time(row.get('overload_until'))}"
     if row.get("temp_unschedulable"):
         reason = clean_account_error(str(row.get("temp_unschedulable_reason") or ""))
-        return h(f"临停至 {short_time(row.get('temp_unschedulable_until'))}" + (f" · {reason}" if reason else ""))
+        return f"临停至 {short_time(row.get('temp_unschedulable_until'))}" + (f" · {reason}" if reason else "")
     if row.get("expired"):
-        return h(f"已过期 {short_time(row.get('expires_at'))}")
+        return f"已过期 {short_time(row.get('expires_at'))}"
     if not row.get("schedulable"):
-        return h("不可调度")
+        return "不可调度"
     if row.get("normal"):
-        return h("正常")
-    return h("非正常")
+        return "正常"
+    return "非正常"
 
 
-def account_quota_summary(row: dict[str, Any]) -> str:
+def plain_account_quota_summary(row: dict[str, Any]) -> str:
     parts = []
     if row.get("codex_5h_used_percent") is not None:
         parts.append(f"5h {row.get('codex_5h_used_percent')}%")
     if row.get("codex_7d_used_percent") is not None:
         parts.append(f"7d {row.get('codex_7d_used_percent')}%")
-    return h(" · ").join(h(part) for part in parts)
+    return " · ".join(parts)
+
+
+def account_quota_summary(row: dict[str, Any]) -> str:
+    return h(plain_account_quota_summary(row))
 
 
 def clean_account_error(message: str) -> str:
