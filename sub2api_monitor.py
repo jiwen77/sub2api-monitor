@@ -503,26 +503,32 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
         sql = f"""
 WITH rows AS (
   SELECT
-    id,
-    created_at,
-    platform,
-    coalesce(nullif(requested_model,''), nullif(upstream_model,''), nullif(model,''), '') AS model,
-    status_code,
-    upstream_status_code,
-    coalesce(error_type, '') AS error_type,
-    coalesce(provider_error_type, '') AS provider_error_type,
-    coalesce(provider_error_code, '') AS provider_error_code,
-    coalesce(network_error_type, '') AS network_error_type,
-    coalesce(error_owner, '') AS error_owner,
-    coalesce(error_source, '') AS error_source,
-    coalesce(is_business_limited, false) AS is_business_limited,
-    coalesce(nullif(upstream_error_message,''), nullif(error_message,''), nullif(provider_error_type,''), '') AS message,
-    account_id,
-    upstream_endpoint
-  FROM ops_error_logs
-  WHERE id > {last_id}
-    AND created_at >= now() - interval '{lookback} minutes'
-  ORDER BY id ASC
+    e.id,
+    e.created_at,
+    e.platform,
+    coalesce(nullif(e.requested_model,''), nullif(e.upstream_model,''), nullif(e.model,''), '') AS model,
+    e.status_code,
+    e.upstream_status_code,
+    coalesce(e.error_type, '') AS error_type,
+    coalesce(e.provider_error_type, '') AS provider_error_type,
+    coalesce(e.provider_error_code, '') AS provider_error_code,
+    coalesce(e.network_error_type, '') AS network_error_type,
+    coalesce(e.error_owner, '') AS error_owner,
+    coalesce(e.error_source, '') AS error_source,
+    coalesce(e.is_business_limited, false) AS is_business_limited,
+    coalesce(nullif(e.upstream_error_message,''), nullif(e.error_message,''), nullif(e.provider_error_type,''), '') AS message,
+    e.account_id,
+    e.upstream_endpoint,
+    a.proxy_id,
+    coalesce(p.name, '') AS proxy_name,
+    coalesce(p.status, '') AS proxy_status,
+    coalesce(p.protocol, '') AS proxy_protocol
+  FROM ops_error_logs e
+  LEFT JOIN accounts a ON a.id = e.account_id
+  LEFT JOIN proxies p ON p.id = a.proxy_id
+  WHERE e.id > {last_id}
+    AND e.created_at >= now() - interval '{lookback} minutes'
+  ORDER BY e.id ASC
   LIMIT {limit}
 )
 SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
@@ -1026,6 +1032,25 @@ def build_error_message(grouped: dict[str, dict[str, Any]], suppressed: int, cfg
     return clamp_message("\n".join(lines))
 
 
+def proxy_display_label(row: dict[str, Any]) -> str:
+    name = str(row.get("proxy_name") or "").strip()
+    proxy_id = row.get("proxy_id")
+    protocol = str(row.get("proxy_protocol") or "").strip()
+    status = str(row.get("proxy_status") or "").strip()
+    if name:
+        label = name
+    elif proxy_id:
+        label = f"#{proxy_id}"
+    else:
+        return ""
+    details = []
+    if protocol:
+        details.append(protocol)
+    if status:
+        details.append(status)
+    return label + (f" ({', '.join(details)})" if details else "")
+
+
 def build_proxy_error_message(grouped: dict[str, dict[str, Any]], suppressed: int, cfg: Config) -> str:
     total = sum(int(g["count"]) for g in grouped.values())
     lines = [
@@ -1043,6 +1068,9 @@ def build_proxy_error_message(grouped: dict[str, dict[str, Any]], suppressed: in
         ids = ",".join(str(r.get("id")) for r in group.get("rows", [])[:5])
         account_ids = sorted({str(r.get("account_id")) for r in group.get("rows", []) if r.get("account_id")})[:5]
         suffix = []
+        proxy_label = proxy_display_label(sample)
+        if proxy_label:
+            suffix.append("proxy " + proxy_label)
         if account_ids:
             suffix.append("accounts " + ",".join("#" + x for x in account_ids))
         if ids:
@@ -1149,6 +1177,7 @@ def proxy_error_key(row: dict[str, Any]) -> str:
         for x in (
             row.get("platform"),
             row.get("model"),
+            row.get("proxy_id") or row.get("proxy_name"),
             row.get("network_error_type"),
             row.get("error_type"),
             row.get("provider_error_type"),

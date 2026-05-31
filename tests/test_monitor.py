@@ -54,6 +54,15 @@ class PredicateTests(unittest.TestCase):
         row = dict(base, message="invalid api key timeout")
         self.assertFalse(mon.is_actionable_proxy_error(row))
 
+
+    def test_proxy_display_label_does_not_need_proxy_url(self):
+        self.assertEqual(
+            m.proxy_display_label({"proxy_id": 7, "proxy_name": "LA Proxy A", "proxy_protocol": "socks5", "proxy_status": "active"}),
+            "LA Proxy A (socks5, active)",
+        )
+        self.assertEqual(m.proxy_display_label({"proxy_id": 7}), "#7")
+        self.assertEqual(m.proxy_display_label({}), "")
+
     def test_proxy_error_message_groups_account_ids(self):
         cfg = m.Config()
         grouped = {
@@ -66,6 +75,10 @@ class PredicateTests(unittest.TestCase):
                     "network_error_type": "proxy_connect",
                     "message": "proxy CONNECT failed",
                     "account_id": 101,
+                    "proxy_id": 7,
+                    "proxy_name": "LA Proxy A",
+                    "proxy_protocol": "socks5",
+                    "proxy_status": "active",
                 },
                 "rows": [
                     {"id": 10, "account_id": 101},
@@ -77,6 +90,7 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("出口/网络错误", message)
         self.assertIn("openai/gpt-test", message)
         self.assertIn("proxy_connect", message)
+        self.assertIn("proxy LA Proxy A (socks5, active)", message)
         self.assertIn("accounts #101,#102", message)
         self.assertIn("ids 10,11", message)
 

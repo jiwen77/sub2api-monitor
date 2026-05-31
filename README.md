@@ -16,7 +16,7 @@ A passive monitoring and Telegram alerting tool for [Sub2API](https://github.com
 - **Upstream and exit-network error alerts**
   - Reads Sub2API `ops_error_logs`.
   - Defaults to provider/upstream `429` and `5xx` alerts.
-  - Separately alerts likely exit-proxy/network failures such as proxy tunnel, DNS, timeout, TLS, connection reset/refused.
+  - Separately alerts likely exit-proxy/network failures such as proxy tunnel, DNS, timeout, TLS, connection reset/refused, including the proxy name when Sub2API has one configured.
   - Filters out common client-side, API-key, authentication, and request-body errors.
 
 - **Readable Telegram cards**
@@ -137,7 +137,7 @@ Most users start with options 1-5 and 10; use option 13 when you want guided con
 
 `Sub2API 上游错误` means the provider/upstream appears to have returned an actionable `429` or `5xx` response. Network-looking errors are excluded from this category.
 
-`Sub2API 出口/网络错误` means the request appears to have failed before reaching the provider successfully, for example proxy tunnel failures, DNS errors, timeout, TLS/certificate errors, or connection reset/refused. This category is useful when an account's configured exit proxy is down.
+`Sub2API 出口/网络错误` means the request appears to have failed before reaching the provider successfully, for example proxy tunnel failures, DNS errors, timeout, TLS/certificate errors, or connection reset/refused. This category is useful when an account's configured exit proxy is down. The alert includes proxy name/id/protocol/status when available, but does not include proxy host, username, or password.
 
 ## Telegram commands
 
