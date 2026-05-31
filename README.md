@@ -135,7 +135,7 @@ Most users start with options 1-5 and 10; use option 13 when you want guided con
 
 ## Error alert categories
 
-`Sub2API 上游错误` means the provider/upstream appears to have returned an actionable `429` or `5xx` response. Network-looking errors are excluded from this category.
+`Sub2API 上游错误` means the provider/upstream appears to have returned an actionable `429` or `5xx` response. Network-looking errors are excluded from this category. Alerts include safe context such as account id/name/plan/status, proxy label, request id, and ops log ids when available.
 
 `Sub2API 出口/网络错误` means the request appears to have failed before reaching the provider successfully, for example proxy tunnel failures, DNS errors, timeout, TLS/certificate errors, or connection reset/refused. This category is useful when an account's configured exit proxy is down. The alert includes proxy name/id/protocol/status when available, but does not include proxy host, username, or password.
 

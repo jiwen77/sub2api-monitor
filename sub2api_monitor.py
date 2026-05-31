@@ -517,7 +517,14 @@ WITH rows AS (
     coalesce(e.error_source, '') AS error_source,
     coalesce(e.is_business_limited, false) AS is_business_limited,
     coalesce(nullif(e.upstream_error_message,''), nullif(e.error_message,''), nullif(e.provider_error_type,''), '') AS message,
+    e.request_id,
+    e.client_request_id,
+    e.request_path,
     e.account_id,
+    coalesce(a.name, '') AS account_name,
+    coalesce(nullif(a.credentials->>'email',''), nullif(a.extra->>'email',''), '') AS account_email,
+    coalesce(nullif(a.credentials->>'plan_type',''), nullif(a.extra->>'plan_type',''), a.type, '') AS account_plan,
+    coalesce(a.status, '') AS account_status,
     e.upstream_endpoint,
     a.proxy_id,
     coalesce(p.name, '') AS proxy_name,
@@ -1007,6 +1014,26 @@ def group_error_rows(
     return grouped, suppressed
 
 
+def error_context_suffix(group: dict[str, Any], cfg: Config, include_proxy: bool = True) -> str:
+    sample = group["sample"]
+    rows = group.get("rows", [])
+    suffix = []
+    if include_proxy:
+        proxy_label = proxy_display_label(sample)
+        if proxy_label:
+            suffix.append("proxy " + proxy_label)
+    account_labels = grouped_account_labels(rows, cfg)
+    if account_labels:
+        suffix.append("accounts " + "; ".join(account_labels))
+    request_ids = grouped_request_ids(rows)
+    if request_ids:
+        suffix.append("req " + ",".join(request_ids))
+    ids = ",".join(str(r.get("id")) for r in rows[:5])
+    if ids:
+        suffix.append("ids " + ids)
+    return " · ".join(suffix)
+
+
 def build_error_message(grouped: dict[str, dict[str, Any]], suppressed: int, cfg: Config) -> str:
     total = sum(int(g["count"]) for g in grouped.values())
     lines = [
@@ -1021,15 +1048,67 @@ def build_error_message(grouped: dict[str, dict[str, Any]], suppressed: int, cfg
         status = sample.get("upstream_status_code") or sample.get("status_code") or "?"
         model = sample.get("model") or "unknown-model"
         msg = truncate(re.sub(r"\s+", " ", str(sample.get("message") or "")).strip(), 120)
-        ids = ",".join(str(r.get("id")) for r in group.get("rows", [])[:5])
+        suffix = error_context_suffix(group, cfg, include_proxy=True)
         lines.append(
             f"🔴 {tg_code(str(sample.get('platform') or 'unknown') + '/' + str(model))} "
             f"{tg_code(str(status))} ×{int(group['count'])}"
         )
-        lines.append(f"  {h(msg)}" + (f" · {tg_code('ids ' + ids)}" if ids else ""))
+        lines.append(f"  {h(msg)}" + (f" · {tg_code(suffix)}" if suffix else ""))
     if len(grouped) > cfg.detail_limit:
         lines.append(muted(f"另有 {len(grouped) - cfg.detail_limit} 组未展开"))
     return clamp_message("\n".join(lines))
+
+
+def display_error_account(row: dict[str, Any], cfg: Config) -> str:
+    account_id = row.get("account_id")
+    name_row = {"name": row.get("account_name"), "email": row.get("account_email")}
+    name = display_identifier(name_row, cfg)
+    plan = str(row.get("account_plan") or "").strip()
+    status = str(row.get("account_status") or "").strip()
+    bits = []
+    if account_id:
+        bits.append(f"#{account_id}")
+    if name:
+        bits.append(name)
+    extras = []
+    if plan:
+        extras.append(plan)
+    if status:
+        extras.append(status)
+    if extras:
+        bits.append("(" + ", ".join(extras) + ")")
+    return " ".join(bits)
+
+
+def grouped_account_labels(rows: list[dict[str, Any]], cfg: Config, limit: int = 5) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        label = display_error_account(row, cfg)
+        if not label:
+            continue
+        key = str(row.get("account_id") or label)
+        if key in seen:
+            continue
+        seen.add(key)
+        labels.append(label)
+        if len(labels) >= limit:
+            break
+    return labels
+
+
+def grouped_request_ids(rows: list[dict[str, Any]], limit: int = 3) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        raw = str(row.get("request_id") or row.get("client_request_id") or "").strip()
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        values.append(truncate(raw, 18))
+        if len(values) >= limit:
+            break
+    return values
 
 
 def proxy_display_label(row: dict[str, Any]) -> str:
@@ -1065,21 +1144,12 @@ def build_proxy_error_message(grouped: dict[str, dict[str, Any]], suppressed: in
         model = sample.get("model") or "unknown-model"
         kind = sample.get("network_error_type") or sample.get("error_type") or sample.get("upstream_status_code") or sample.get("status_code") or "network"
         msg = truncate(re.sub(r"\s+", " ", str(sample.get("message") or "")).strip(), 120)
-        ids = ",".join(str(r.get("id")) for r in group.get("rows", [])[:5])
-        account_ids = sorted({str(r.get("account_id")) for r in group.get("rows", []) if r.get("account_id")})[:5]
-        suffix = []
-        proxy_label = proxy_display_label(sample)
-        if proxy_label:
-            suffix.append("proxy " + proxy_label)
-        if account_ids:
-            suffix.append("accounts " + ",".join("#" + x for x in account_ids))
-        if ids:
-            suffix.append("ids " + ids)
+        suffix = error_context_suffix(group, cfg, include_proxy=True)
         lines.append(
             f"🟠 {tg_code(str(sample.get('platform') or 'unknown') + '/' + str(model))} "
             f"{tg_code(str(kind))} ×{int(group['count'])}"
         )
-        lines.append(f"  {h(msg)}" + (f" · {tg_code(' · '.join(suffix))}" if suffix else ""))
+        lines.append(f"  {h(msg)}" + (f" · {tg_code(suffix)}" if suffix else ""))
     if len(grouped) > cfg.detail_limit:
         lines.append(muted(f"另有 {len(grouped) - cfg.detail_limit} 组未展开"))
     return clamp_message("\n".join(lines))

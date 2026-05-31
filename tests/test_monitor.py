@@ -55,6 +55,51 @@ class PredicateTests(unittest.TestCase):
         self.assertFalse(mon.is_actionable_proxy_error(row))
 
 
+
+    def test_upstream_error_message_includes_account_and_proxy_context(self):
+        cfg = m.Config()
+        grouped = {
+            "upstream:x": {
+                "count": 1,
+                "sample": {
+                    "id": 5766,
+                    "platform": "openai",
+                    "model": "gpt-5.5",
+                    "upstream_status_code": 429,
+                    "message": "The usage limit has been reached",
+                    "account_id": 108,
+                    "account_name": "New Account",
+                    "account_plan": "plus",
+                    "account_status": "active",
+                    "proxy_id": 7,
+                    "proxy_name": "LA Proxy A",
+                    "proxy_protocol": "socks5",
+                    "proxy_status": "active",
+                    "request_id": "req_abcdefghijklmnopqrstuvwxyz",
+                },
+                "rows": [
+                    {
+                        "id": 5766,
+                        "account_id": 108,
+                        "account_name": "New Account",
+                        "account_plan": "plus",
+                        "account_status": "active",
+                        "proxy_id": 7,
+                        "proxy_name": "LA Proxy A",
+                        "proxy_protocol": "socks5",
+                        "proxy_status": "active",
+                        "request_id": "req_abcdefghijklmnopqrstuvwxyz",
+                    }
+                ],
+            }
+        }
+        message = m.build_error_message(grouped, 0, cfg)
+        self.assertIn("openai/gpt-5.5", message)
+        self.assertIn("proxy LA Proxy A", message)
+        self.assertIn("accounts #108 Ne***nt (plus, active)", message)
+        self.assertIn("req req_abcdefghijklm", message)
+        self.assertIn("ids 5766", message)
+
     def test_proxy_display_label_does_not_need_proxy_url(self):
         self.assertEqual(
             m.proxy_display_label({"proxy_id": 7, "proxy_name": "LA Proxy A", "proxy_protocol": "socks5", "proxy_status": "active"}),
@@ -91,7 +136,8 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("openai/gpt-test", message)
         self.assertIn("proxy_connect", message)
         self.assertIn("proxy LA Proxy A (socks5, active)", message)
-        self.assertIn("accounts #101,#102", message)
+        self.assertIn("accounts #101", message)
+        self.assertIn("#102", message)
         self.assertIn("ids 10,11", message)
 
     def test_account_digest_ignores_usage_percent(self):
