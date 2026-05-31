@@ -1,0 +1,16 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Runtime/config secrets
+.env
+.env.*
+config.env
+state.json
+*.log
+
+# OS/editor
+.DS_Store
+*.swp
