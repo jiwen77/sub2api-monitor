@@ -16,6 +16,9 @@ A passive monitoring and Telegram alerting tool for [Sub2API](https://github.com
   - Defaults to provider/upstream `429` and `5xx` alerts.
   - Filters out common client-side, API-key, authentication, request-body, and network-looking errors.
 
+- **Readable Telegram cards**
+  - Uses compact lines, emoji severity hints, bold section headers, and shortened error summaries.
+
 - **Daily usage report**
   - Reads Sub2API `usage_logs`.
   - Sends previous-day totals and current-day-to-now totals.
@@ -128,6 +131,7 @@ Important options:
 | `POSTGRES_CONTAINER` | `sub2api-postgres` | PostgreSQL container name. |
 | `TELEGRAM_BOT_TOKEN` | empty | Telegram bot token. |
 | `TELEGRAM_CHAT_ID` | empty | Telegram chat/channel/user ID. |
+| `TELEGRAM_PARSE_MODE` | `HTML` | Telegram formatting mode for readable bold headings and code labels. |
 | `POLL_INTERVAL_SECONDS` | `60` | Daemon polling interval. |
 | `ERROR_LOOKBACK_MINUTES` | `30` | Lookback window for new upstream errors. |
 | `ERROR_COOLDOWN_SECONDS` | `600` | Per-error-group cooldown. |

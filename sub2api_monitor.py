@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import html
 import json
 import logging
 import os
@@ -63,6 +64,7 @@ class Config:
     telegram_chat_id: str = ""
     telegram_api_base: str = "https://api.telegram.org"
     telegram_disable_web_page_preview: bool = True
+    telegram_parse_mode: str = "HTML"
     send_startup_summary: bool = True
     alert_existing_errors_on_first_run: bool = False
     redact_identifiers: bool = True
@@ -111,6 +113,7 @@ class Config:
         cfg.telegram_chat_id = get_str(merged, "TELEGRAM_CHAT_ID", cfg.telegram_chat_id)
         cfg.telegram_api_base = get_str(merged, "TELEGRAM_API_BASE", cfg.telegram_api_base).rstrip("/")
         cfg.telegram_disable_web_page_preview = get_bool(merged, "TELEGRAM_DISABLE_WEB_PAGE_PREVIEW", cfg.telegram_disable_web_page_preview)
+        cfg.telegram_parse_mode = get_str(merged, "TELEGRAM_PARSE_MODE", cfg.telegram_parse_mode).strip()
         cfg.send_startup_summary = get_bool(merged, "SEND_STARTUP_SUMMARY", cfg.send_startup_summary)
         cfg.alert_existing_errors_on_first_run = get_bool(merged, "ALERT_EXISTING_ERRORS_ON_FIRST_RUN", cfg.alert_existing_errors_on_first_run)
         cfg.redact_identifiers = get_bool(merged, "REDACT_IDENTIFIERS", cfg.redact_identifiers)
@@ -172,7 +175,7 @@ class Monitor:
                     self.send(account_msg)
         except Exception:
             logging.exception("account check failed")
-            msg = f"⚠️ {APP_NAME} 账号状态检查失败\n{short_exc()}"
+            msg = build_simple_alert("⚠️ 账号状态检查失败", short_exc(), self.cfg)
             if notify:
                 self.send(msg)
 
@@ -185,7 +188,7 @@ class Monitor:
                     self.send(error_msg)
         except Exception:
             logging.exception("upstream error check failed")
-            msg = f"⚠️ {APP_NAME} 上游错误检查失败\n{short_exc()}"
+            msg = build_simple_alert("⚠️ 上游错误检查失败", short_exc(), self.cfg)
             if notify:
                 self.send(msg)
 
@@ -198,7 +201,7 @@ class Monitor:
                         self.send(daily_msg)
             except Exception:
                 logging.exception("daily report failed")
-                msg = f"⚠️ {APP_NAME} 日报生成失败\n{short_exc()}"
+                msg = build_simple_alert("⚠️ 日报生成失败", short_exc(), self.cfg)
                 if notify:
                     self.send(msg)
 
@@ -567,20 +570,8 @@ def summarize_accounts(rows: list[dict[str, Any]]) -> tuple[list[str], dict[tupl
         if row.get("expired"):
             b["expired"] += 1
     lines: list[str] = []
-    for (platform, plan), b in sorted(buckets.items()):
-        tail = []
-        if b["rate_limited"]:
-            tail.append(f"限流 {b['rate_limited']}")
-        if b["error"]:
-            tail.append(f"异常 {b['error']}")
-        if b["overloaded"]:
-            tail.append(f"过载 {b['overloaded']}")
-        if b["temp"]:
-            tail.append(f"临停 {b['temp']}")
-        if b["expired"]:
-            tail.append(f"过期 {b['expired']}")
-        suffix = f"（{', '.join(tail)}）" if tail else ""
-        lines.append(f"- {platform}/{plan}: 正常 {b['normal']}/{b['total']}{suffix}")
+    for key, b in sorted(buckets.items()):
+        lines.append(format_summary_line(key, b, html_mode=False))
     return lines, buckets
 
 
@@ -592,55 +583,160 @@ def build_account_message(
     cfg: Config,
     title: str,
 ) -> str:
-    summary_lines, _ = summarize_accounts(rows)
-    lines = [title, f"时间：{now_iso(cfg.tzinfo())}", "", "账号概览：", *summary_lines]
-    abnormal = [r for r in rows if not r.get("normal")]
+    _summary_lines, buckets = summarize_accounts(rows)
+    lines = [
+        f"{h(title)}",
+        muted(now_iso(cfg.tzinfo())),
+        "",
+        section("账号概览"),
+    ]
+    for key, bucket in sorted(buckets.items()):
+        lines.append(format_summary_line(key, bucket, html_mode=True))
+
+    abnormal = sorted([r for r in rows if not r.get("normal")], key=account_sort_key)
     if changed or added or removed:
-        lines += ["", f"变化：变更 {len(changed)} / 新增 {len(added)} / 移除 {len(removed)}"]
-        for label, items in (("变更", changed), ("新增", added)):
+        lines += ["", section(f"变化 · {len(changed)} 变更 / {len(added)} 新增 / {len(removed)} 移除")]
+        shown = 0
+        for label, icon, items in (("变更", "🔄", changed), ("新增", "➕", added)):
             for row in items[: cfg.detail_limit]:
-                lines.append(f"- {label}: {format_account_row(row, cfg)}")
+                lines.append(format_account_row(row, cfg, prefix=f"{icon} {label}"))
+                shown += 1
         for old in removed[: cfg.detail_limit]:
-            lines.append(f"- 移除: #{old.get('id')} {old.get('platform')}/{old.get('plan')} status={old.get('status')}")
-        overflow = max(0, len(changed) + len(added) + len(removed) - cfg.detail_limit * 3)
-        if overflow:
-            lines.append(f"- 另有 {overflow} 条变化未展开")
+            lines.append(
+                f"➖ 移除 {tg_code('#' + str(old.get('id')))} "
+                f"{tg_code(str(old.get('platform') or 'unknown') + '/' + str(old.get('plan') or 'unknown'))}"
+            )
+            shown += 1
+        total_changes = len(changed) + len(added) + len(removed)
+        if total_changes > shown:
+            lines.append(muted(f"另有 {total_changes - shown} 条变化未展开"))
+
     if abnormal:
-        lines += ["", "当前非正常账号："]
+        lines += ["", section("需要关注")]
         for row in abnormal[: cfg.detail_limit]:
-            lines.append(f"- {format_account_row(row, cfg)}")
+            lines.append(format_account_row(row, cfg))
         if len(abnormal) > cfg.detail_limit:
-            lines.append(f"- 另有 {len(abnormal) - cfg.detail_limit} 个非正常账号未展开")
+            lines.append(muted(f"另有 {len(abnormal) - cfg.detail_limit} 个非正常账号未展开"))
     return clamp_message("\n".join(lines))
 
 
-def format_account_row(row: dict[str, Any], cfg: Config) -> str:
-    ident = f"#{row.get('id')}"
+def account_sort_key(row: dict[str, Any]) -> tuple[int, int]:
+    if row.get("status") not in ("active", ""):
+        severity = 0
+    elif row.get("rate_limited"):
+        severity = 1
+    else:
+        severity = 2
+    try:
+        account_id = int(row.get("id") or 0)
+    except Exception:
+        account_id = 0
+    return severity, account_id
+
+
+def format_summary_line(key: tuple[str, str], bucket: dict[str, int], html_mode: bool) -> str:
+    platform, plan = key
+    total = max(int(bucket.get("total") or 0), 0)
+    normal = max(int(bucket.get("normal") or 0), 0)
+    extras = []
+    if bucket.get("rate_limited"):
+        extras.append(f"限流{bucket['rate_limited']}")
+    if bucket.get("error"):
+        extras.append(f"异常{bucket['error']}")
+    if bucket.get("overloaded"):
+        extras.append(f"过载{bucket['overloaded']}")
+    if bucket.get("temp"):
+        extras.append(f"临停{bucket['temp']}")
+    if bucket.get("expired"):
+        extras.append(f"过期{bucket['expired']}")
+    icon = summary_icon(normal, total, extras)
+    label = f"{platform}/{plan}"
+    if html_mode:
+        base = f"{icon} {tg_code(label)} {normal}/{total}"
+        return base + (f" · {h(' · '.join(extras))}" if extras else "")
+    return f"{icon} {label} {normal}/{total}" + (f" · {' · '.join(extras)}" if extras else "")
+
+
+def summary_icon(normal: int, total: int, extras: list[str]) -> str:
+    if total <= 0 or normal == 0:
+        return "🔴"
+    if normal < total or extras:
+        return "🟡"
+    return "🟢"
+
+
+def format_account_row(row: dict[str, Any], cfg: Config, prefix: str = "") -> str:
+    icon = account_icon(row)
+    label = f"{row.get('platform') or 'unknown'}/{row.get('plan') or 'unknown'}"
+    ident = tg_code(f"#{row.get('id')}")
     name = display_identifier(row, cfg)
-    bits = [ident]
+    head_bits = [icon]
+    if prefix:
+        head_bits.append(h(prefix))
+    head_bits.append(ident)
     if name:
-        bits.append(name)
-    bits.append(f"{row.get('platform')}/{row.get('plan')}/{row.get('type')}")
-    bits.append(f"status={row.get('status')}")
-    bits.append("normal=Y" if row.get("normal") else "normal=N")
-    if not row.get("schedulable"):
-        bits.append("schedulable=N")
+        head_bits.append(h(name))
+    head_bits.append(tg_code(label))
+
+    detail = account_state_summary(row)
+    quota = account_quota_summary(row)
+    second_bits = [detail]
+    if quota:
+        second_bits.append(quota)
+    return " ".join(head_bits) + "\n  " + h(" · ").join(second_bits)
+
+
+def account_icon(row: dict[str, Any]) -> str:
+    if row.get("status") not in ("active", ""):
+        return "🔴"
     if row.get("rate_limited"):
-        bits.append(f"限流到 {fmt_time(row.get('rate_limit_reset_at'))}")
+        return "🟡"
+    if row.get("overloaded") or row.get("temp_unschedulable") or row.get("expired"):
+        return "🟠"
+    if not row.get("normal"):
+        return "⚪️"
+    return "🟢"
+
+
+def account_state_summary(row: dict[str, Any]) -> str:
+    if row.get("status") not in ("active", ""):
+        err = clean_account_error(str(row.get("error_message") or ""))
+        return h(f"异常：{row.get('status') or 'unknown'}" + (f" · {err}" if err else ""))
+    if row.get("rate_limited"):
+        return h(f"限流至 {short_time(row.get('rate_limit_reset_at'))}")
     if row.get("overloaded"):
-        bits.append(f"过载到 {fmt_time(row.get('overload_until'))}")
+        return h(f"过载至 {short_time(row.get('overload_until'))}")
     if row.get("temp_unschedulable"):
-        reason = truncate(str(row.get("temp_unschedulable_reason") or ""), 80)
-        bits.append(f"临停到 {fmt_time(row.get('temp_unschedulable_until'))}" + (f"/{reason}" if reason else ""))
+        reason = clean_account_error(str(row.get("temp_unschedulable_reason") or ""))
+        return h(f"临停至 {short_time(row.get('temp_unschedulable_until'))}" + (f" · {reason}" if reason else ""))
     if row.get("expired"):
-        bits.append(f"过期 {fmt_time(row.get('expires_at'))}")
-    if row.get("error_message"):
-        bits.append("错误=" + truncate(str(row.get("error_message")), 120))
+        return h(f"已过期 {short_time(row.get('expires_at'))}")
+    if not row.get("schedulable"):
+        return h("不可调度")
+    if row.get("normal"):
+        return h("正常")
+    return h("非正常")
+
+
+def account_quota_summary(row: dict[str, Any]) -> str:
+    parts = []
     if row.get("codex_5h_used_percent") is not None:
-        bits.append(f"5h={row.get('codex_5h_used_percent')}%")
+        parts.append(f"5h {row.get('codex_5h_used_percent')}%")
     if row.get("codex_7d_used_percent") is not None:
-        bits.append(f"7d={row.get('codex_7d_used_percent')}%")
-    return " | ".join(str(x) for x in bits if x not in (None, ""))
+        parts.append(f"7d {row.get('codex_7d_used_percent')}%")
+    return h(" · ").join(h(part) for part in parts)
+
+
+def clean_account_error(message: str) -> str:
+    message = re.sub(r"\s+", " ", message).strip()
+    replacements = [
+        (r"^Token revoked \(401\):.*", "Token revoked (401)"),
+        (r"Encountered invalidated oauth token.*", "Invalidated OAuth token"),
+    ]
+    for pattern, repl in replacements:
+        if re.search(pattern, message, flags=re.I):
+            return repl
+    return truncate(message, 64)
 
 
 def display_identifier(row: dict[str, Any], cfg: Config) -> str:
@@ -660,23 +756,25 @@ def display_identifier(row: dict[str, Any], cfg: Config) -> str:
 def build_error_message(grouped: dict[str, dict[str, Any]], suppressed: int, cfg: Config) -> str:
     total = sum(int(g["count"]) for g in grouped.values())
     lines = [
-        "🚨 sub2api 上游错误",
-        f"时间：{now_iso(cfg.tzinfo())}",
-        f"新增：{total} 条 / {len(grouped)} 组" + (f"（冷却抑制 {suppressed} 条）" if suppressed else ""),
+        "🚨 <b>Sub2API 上游错误</b>",
+        muted(now_iso(cfg.tzinfo())),
+        h(f"新增 {total} 条 / {len(grouped)} 组") + (h(f" · 冷却抑制 {suppressed} 条") if suppressed else ""),
         "",
+        section("错误分组"),
     ]
     for group in sorted(grouped.values(), key=lambda g: -int(g["count"]))[: cfg.detail_limit]:
         sample = group["sample"]
         status = sample.get("upstream_status_code") or sample.get("status_code") or "?"
-        model = sample.get("model") or "(unknown-model)"
-        msg = truncate(str(sample.get("message") or ""), 180)
-        ids = [str(r.get("id")) for r in group.get("rows", [])[:5]]
+        model = sample.get("model") or "unknown-model"
+        msg = truncate(re.sub(r"\s+", " ", str(sample.get("message") or "")).strip(), 120)
+        ids = ",".join(str(r.get("id")) for r in group.get("rows", [])[:5])
         lines.append(
-            f"- {sample.get('platform')}/{model} upstream={status} x{group['count']} "
-            f"type={sample.get('error_type') or '-'} ids={','.join(ids)}\n  {msg}"
+            f"🔴 {tg_code(str(sample.get('platform') or 'unknown') + '/' + str(model))} "
+            f"{tg_code(str(status))} ×{int(group['count'])}"
         )
+        lines.append(f"  {h(msg)}" + (f" · {tg_code('ids ' + ids)}" if ids else ""))
     if len(grouped) > cfg.detail_limit:
-        lines.append(f"- 另有 {len(grouped) - cfg.detail_limit} 组未展开")
+        lines.append(muted(f"另有 {len(grouped) - cfg.detail_limit} 组未展开"))
     return clamp_message("\n".join(lines))
 
 
@@ -684,27 +782,36 @@ def build_daily_message(day: dt.date, yesterday: dict[str, Any], today_date: dt.
     ys = yesterday.get("summary") or {}
     ts = today.get("summary") or {}
     lines = [
-        "📊 sub2api 每日用量汇总",
-        f"发送时间：{now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        "📊 <b>Sub2API 每日用量</b>",
+        muted(now.strftime('%Y-%m-%d %H:%M:%S %Z')),
         "",
-        f"昨日 {day.isoformat()}：{fmt_int(ys.get('total_tokens'))} tokens / {fmt_int(ys.get('requests'))} requests / cost {fmt_money(ys.get('total_cost'))}",
-        f"  input {fmt_int(ys.get('input_tokens'))} / output {fmt_int(ys.get('output_tokens'))} / cache {fmt_int(ys.get('cache_tokens'))} / image_out {fmt_int(ys.get('image_output_tokens'))}",
-        f"  avg duration {ys.get('avg_duration_ms', 0)} ms / avg first token {ys.get('avg_first_token_ms', 0)} ms",
-        f"今日 {today_date.isoformat()} 截至当前：{fmt_int(ts.get('total_tokens'))} tokens / {fmt_int(ts.get('requests'))} requests / cost {fmt_money(ts.get('total_cost'))}",
+        section(f"昨日 {day.isoformat()}"),
+        f"Tokens {tg_code(fmt_compact_int(ys.get('total_tokens')))} · Requests {tg_code(fmt_int(ys.get('requests')))} · Cost {tg_code(fmt_money(ys.get('total_cost')))}",
+        f"Input {tg_code(fmt_compact_int(ys.get('input_tokens')))} · Output {tg_code(fmt_compact_int(ys.get('output_tokens')))} · Cache {tg_code(fmt_compact_int(ys.get('cache_tokens')))}",
+        f"Avg {tg_code(str(ys.get('avg_duration_ms', 0)) + ' ms')} · First token {tg_code(str(ys.get('avg_first_token_ms', 0)) + ' ms')}",
+        "",
+        section(f"今日 {today_date.isoformat()} 截至当前"),
+        f"Tokens {tg_code(fmt_compact_int(ts.get('total_tokens')))} · Requests {tg_code(fmt_int(ts.get('requests')))} · Cost {tg_code(fmt_money(ts.get('total_cost')))}",
     ]
     if yesterday.get("by_plan"):
-        lines += ["", "昨日按账号类型："]
+        lines += ["", section("昨日按账号类型")]
         for row in yesterday["by_plan"][: cfg.detail_limit]:
             lines.append(
-                f"- {row.get('platform')}/{row.get('plan')}: {fmt_int(row.get('total_tokens'))} tokens / {fmt_int(row.get('requests'))} req / {fmt_money(row.get('total_cost'))}"
+                f"• {tg_code(str(row.get('platform') or 'unknown') + '/' + str(row.get('plan') or 'unknown'))} "
+                f"{h(fmt_compact_int(row.get('total_tokens')) + ' tokens')} · {h(fmt_int(row.get('requests')) + ' req')}"
             )
     if yesterday.get("top_models"):
-        lines += ["", "昨日 Top 模型："]
-        for row in yesterday["top_models"][: min(10, cfg.detail_limit)]:
+        lines += ["", section("昨日 Top 模型")]
+        for row in yesterday["top_models"][: min(8, cfg.detail_limit)]:
             lines.append(
-                f"- {row.get('model')}: {fmt_int(row.get('total_tokens'))} tokens / {fmt_int(row.get('requests'))} req / {fmt_money(row.get('total_cost'))}"
+                f"• {tg_code(str(row.get('model') or 'unknown'))} "
+                f"{h(fmt_compact_int(row.get('total_tokens')) + ' tokens')} · {h(fmt_int(row.get('requests')) + ' req')}"
             )
     return clamp_message("\n".join(lines))
+
+
+def build_simple_alert(title: str, detail: str, cfg: Config) -> str:
+    return "\n".join([h(title), muted(now_iso(cfg.tzinfo())), h(truncate(detail, 500))])
 
 
 # ------------------------------- predicates ----------------------------------
@@ -765,7 +872,7 @@ def send_telegram(cfg: Config, text: str, dry_run: bool = False) -> None:
         prefix = "[dry-run telegram]" if dry_run else "[telegram disabled: missing TELEGRAM_BOT_TOKEN/CHAT_ID]"
         for chunk in chunks:
             logging.info("%s message_len=%s", prefix, len(chunk))
-            print(f"{prefix}\n{chunk}\n")
+            print(f"{prefix}\n{render_for_terminal(chunk)}\n")
         return
     for chunk in chunks:
         url = f"{cfg.telegram_api_base}/bot{cfg.telegram_bot_token}/sendMessage"
@@ -774,6 +881,8 @@ def send_telegram(cfg: Config, text: str, dry_run: bool = False) -> None:
             "text": chunk,
             "disable_web_page_preview": "true" if cfg.telegram_disable_web_page_preview else "false",
         }
+        if cfg.telegram_parse_mode:
+            payload["parse_mode"] = cfg.telegram_parse_mode
         data = urllib.parse.urlencode(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, method="POST")
         try:
@@ -789,6 +898,53 @@ def send_telegram(cfg: Config, text: str, dry_run: bool = False) -> None:
 
 # -------------------------------- utilities -----------------------------------
 
+
+
+
+def h(value: Any) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def tg_code(value: Any) -> str:
+    return f"<code>{h(value)}</code>"
+
+
+def section(title: str) -> str:
+    return f"<b>{h(title)}</b>"
+
+
+def muted(text: str) -> str:
+    return tg_code(text)
+
+
+def render_for_terminal(message: str) -> str:
+    # Make dry-run/menu output readable even when Telegram HTML formatting is enabled.
+    rendered = re.sub(r"</?(?:b|strong|i|em|u|s|strike|del|code|pre)>", "", message)
+    return html.unescape(rendered)
+
+
+def short_time(value: Any) -> str:
+    raw = fmt_time(value)
+    if raw == "-":
+        return raw
+    # Prefer compact local-looking timestamps in Telegram rows.
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}:\d{2})", raw)
+    if match:
+        return f"{match.group(2)}-{match.group(3)} {match.group(4)}"
+    return raw[:16]
+
+
+def fmt_compact_int(value: Any) -> str:
+    try:
+        n = int(value or 0)
+    except Exception:
+        return "0"
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    for suffix, unit in (("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)):
+        if n >= unit:
+            return f"{sign}{n / unit:.2f}{suffix}"
+    return f"{sign}{n}"
 
 def first_existing(paths: Iterable[str]) -> str | None:
     for p in paths:
@@ -980,7 +1136,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "account-summary":
         rows = mon.current_account_rows()
         msg = build_account_message(rows, [], [], [], cfg, title="ℹ️ sub2api 当前账号状态")
-        print(msg)
+        print(render_for_terminal(msg))
         return 0
     if args.command == "daily":
         tz = cfg.tzinfo()
@@ -992,7 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.notify:
             mon.send(msg)
         else:
-            print(msg)
+            print(render_for_terminal(msg))
         return 0
     if args.command == "test-telegram":
         mon.send(f"✅ {APP_NAME} Telegram 测试成功\n时间：{now_iso(cfg.tzinfo())}")
