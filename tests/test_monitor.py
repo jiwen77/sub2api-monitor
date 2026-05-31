@@ -95,10 +95,11 @@ class PredicateTests(unittest.TestCase):
         }
         message = m.build_error_message(grouped, 0, cfg)
         self.assertIn("openai/gpt-5.5", message)
-        self.assertIn("proxy LA Proxy A", message)
-        self.assertIn("accounts #108 Ne***nt (plus, active)", message)
-        self.assertIn("req req_abcdefghijklm", message)
-        self.assertIn("ids 5766", message)
+        self.assertIn("代理：LA Proxy A", message)
+        self.assertIn("账号：#108 Ne***nt (plus, active)", message)
+        self.assertIn("原因：The usage limit has been reached", message)
+        self.assertNotIn("req req_", message)
+        self.assertNotIn("ids 5766", message)
 
     def test_proxy_display_label_does_not_need_proxy_url(self):
         self.assertEqual(
@@ -135,10 +136,11 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("出口/网络错误", message)
         self.assertIn("openai/gpt-test", message)
         self.assertIn("proxy_connect", message)
-        self.assertIn("proxy LA Proxy A (socks5, active)", message)
-        self.assertIn("accounts #101", message)
+        self.assertIn("代理：LA Proxy A (socks5, active)", message)
+        self.assertIn("账号：#101", message)
         self.assertIn("#102", message)
-        self.assertIn("ids 10,11", message)
+        self.assertIn("原因：proxy CONNECT failed", message)
+        self.assertNotIn("ids 10,11", message)
 
     def test_account_digest_ignores_usage_percent(self):
         row = {

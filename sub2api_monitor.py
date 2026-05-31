@@ -1014,24 +1014,18 @@ def group_error_rows(
     return grouped, suppressed
 
 
-def error_context_suffix(group: dict[str, Any], cfg: Config, include_proxy: bool = True) -> str:
+def error_context_lines(group: dict[str, Any], cfg: Config, include_proxy: bool = True) -> list[str]:
     sample = group["sample"]
     rows = group.get("rows", [])
-    suffix = []
+    lines: list[str] = []
+    account_labels = grouped_account_labels(rows, cfg, limit=3)
+    if account_labels:
+        lines.append("账号：" + "；".join(account_labels))
     if include_proxy:
         proxy_label = proxy_display_label(sample)
         if proxy_label:
-            suffix.append("proxy " + proxy_label)
-    account_labels = grouped_account_labels(rows, cfg)
-    if account_labels:
-        suffix.append("accounts " + "; ".join(account_labels))
-    request_ids = grouped_request_ids(rows)
-    if request_ids:
-        suffix.append("req " + ",".join(request_ids))
-    ids = ",".join(str(r.get("id")) for r in rows[:5])
-    if ids:
-        suffix.append("ids " + ids)
-    return " · ".join(suffix)
+            lines.append("代理：" + proxy_label)
+    return lines
 
 
 def build_error_message(grouped: dict[str, dict[str, Any]], suppressed: int, cfg: Config) -> str:
@@ -1047,13 +1041,15 @@ def build_error_message(grouped: dict[str, dict[str, Any]], suppressed: int, cfg
         sample = group["sample"]
         status = sample.get("upstream_status_code") or sample.get("status_code") or "?"
         model = sample.get("model") or "unknown-model"
-        msg = truncate(re.sub(r"\s+", " ", str(sample.get("message") or "")).strip(), 120)
-        suffix = error_context_suffix(group, cfg, include_proxy=True)
+        msg = truncate(re.sub(r"\s+", " ", str(sample.get("message") or "")).strip(), 96)
         lines.append(
             f"🔴 {tg_code(str(sample.get('platform') or 'unknown') + '/' + str(model))} "
             f"{tg_code(str(status))} ×{int(group['count'])}"
         )
-        lines.append(f"  {h(msg)}" + (f" · {tg_code(suffix)}" if suffix else ""))
+        for context_line in error_context_lines(group, cfg, include_proxy=True):
+            lines.append(f"  {h(context_line)}")
+        if msg:
+            lines.append(f"  {h('原因：' + msg)}")
     if len(grouped) > cfg.detail_limit:
         lines.append(muted(f"另有 {len(grouped) - cfg.detail_limit} 组未展开"))
     return clamp_message("\n".join(lines))
@@ -1143,13 +1139,15 @@ def build_proxy_error_message(grouped: dict[str, dict[str, Any]], suppressed: in
         sample = group["sample"]
         model = sample.get("model") or "unknown-model"
         kind = sample.get("network_error_type") or sample.get("error_type") or sample.get("upstream_status_code") or sample.get("status_code") or "network"
-        msg = truncate(re.sub(r"\s+", " ", str(sample.get("message") or "")).strip(), 120)
-        suffix = error_context_suffix(group, cfg, include_proxy=True)
+        msg = truncate(re.sub(r"\s+", " ", str(sample.get("message") or "")).strip(), 96)
         lines.append(
             f"🟠 {tg_code(str(sample.get('platform') or 'unknown') + '/' + str(model))} "
             f"{tg_code(str(kind))} ×{int(group['count'])}"
         )
-        lines.append(f"  {h(msg)}" + (f" · {tg_code(suffix)}" if suffix else ""))
+        for context_line in error_context_lines(group, cfg, include_proxy=True):
+            lines.append(f"  {h(context_line)}")
+        if msg:
+            lines.append(f"  {h('原因：' + msg)}")
     if len(grouped) > cfg.detail_limit:
         lines.append(muted(f"另有 {len(grouped) - cfg.detail_limit} 组未展开"))
     return clamp_message("\n".join(lines))
