@@ -50,3 +50,19 @@ class PredicateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TelegramCommandTests(unittest.TestCase):
+    def test_normalize_telegram_command(self):
+        self.assertEqual(m.normalize_telegram_command('/status@SomeBot now'), '/status')
+        self.assertEqual(m.normalize_telegram_command('/DAILY'), '/daily')
+
+    def test_chat_authorization_defaults_to_notification_chat(self):
+        cfg = m.Config(telegram_chat_id='123')
+        self.assertTrue(m.telegram_chat_allowed(cfg, '123'))
+        self.assertFalse(m.telegram_chat_allowed(cfg, '456'))
+
+    def test_chat_authorization_allows_explicit_list(self):
+        cfg = m.Config(telegram_chat_id='123', telegram_allowed_chat_ids='456, 789')
+        self.assertFalse(m.telegram_chat_allowed(cfg, '123'))
+        self.assertTrue(m.telegram_chat_allowed(cfg, '456'))
+        self.assertTrue(m.telegram_chat_allowed(cfg, '789'))

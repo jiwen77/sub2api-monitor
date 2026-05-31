@@ -25,6 +25,11 @@ A passive monitoring and Telegram alerting tool for [Sub2API](https://github.com
   - Sends previous-day totals and current-day-to-now totals.
   - Includes request count, token totals, cost, account-plan breakdown, and top models.
 
+- **Telegram bot commands**
+  - While the daemon is running, send `/status` to receive the current account status immediately.
+  - Supports `/daily`, `/ping`, and `/help`.
+  - Only authorized chat IDs are served.
+
 - **Interactive management script**
   - Configure Telegram.
   - Test notifications.
@@ -100,6 +105,27 @@ sudo UPDATE_REPO_URL=https://github.com/yourname/sub2api-monitor.git \
   /opt/sub2api-monitor/monitor.sh --update
 ```
 
+
+## Telegram commands
+
+When the systemd service or `daemon` command is running, the bot can also receive commands from Telegram:
+
+| Command | Description |
+| --- | --- |
+| `/status` | Send the current account status immediately. |
+| `/accounts` | Alias for `/status`. |
+| `/daily` | Send the previous-day/current-day usage report. |
+| `/ping` | Check whether the daemon is receiving commands. |
+| `/help` | Show command help. |
+
+By default, commands are only accepted from `TELEGRAM_CHAT_ID`. To authorize multiple chats, set:
+
+```env
+TELEGRAM_ALLOWED_CHAT_IDS=123456789,-1001234567890
+```
+
+The daemon drops pending Telegram updates on first startup by default so old `/start` or `/status` messages are not replayed. Change this with `TELEGRAM_DROP_PENDING_UPDATES=false` if you want to process queued commands after first startup.
+
 ## Manual commands
 
 ```bash
@@ -135,6 +161,9 @@ Important options:
 | `TELEGRAM_BOT_TOKEN` | empty | Telegram bot token. |
 | `TELEGRAM_CHAT_ID` | empty | Telegram chat/channel/user ID. |
 | `TELEGRAM_PARSE_MODE` | `HTML` | Telegram formatting mode for readable bold headings and code labels. |
+| `TELEGRAM_COMMANDS_ENABLED` | `true` | Enable `/status`, `/daily`, `/ping`, and `/help` command polling in daemon mode. |
+| `TELEGRAM_COMMAND_POLL_INTERVAL_SECONDS` | `5` | How often daemon mode checks Telegram commands. |
+| `TELEGRAM_ALLOWED_CHAT_IDS` | empty | Optional comma-separated allowlist; defaults to `TELEGRAM_CHAT_ID`. |
 | `POLL_INTERVAL_SECONDS` | `60` | Daemon polling interval. |
 | `ERROR_LOOKBACK_MINUTES` | `30` | Lookback window for new upstream errors. |
 | `ERROR_COOLDOWN_SECONDS` | `600` | Per-error-group cooldown. |

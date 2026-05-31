@@ -65,6 +65,10 @@ class Config:
     telegram_api_base: str = "https://api.telegram.org"
     telegram_disable_web_page_preview: bool = True
     telegram_parse_mode: str = "HTML"
+    telegram_commands_enabled: bool = True
+    telegram_command_poll_interval_seconds: int = 5
+    telegram_allowed_chat_ids: str = ""
+    telegram_drop_pending_updates: bool = True
     send_startup_summary: bool = True
     alert_existing_errors_on_first_run: bool = False
     redact_identifiers: bool = True
@@ -114,6 +118,10 @@ class Config:
         cfg.telegram_api_base = get_str(merged, "TELEGRAM_API_BASE", cfg.telegram_api_base).rstrip("/")
         cfg.telegram_disable_web_page_preview = get_bool(merged, "TELEGRAM_DISABLE_WEB_PAGE_PREVIEW", cfg.telegram_disable_web_page_preview)
         cfg.telegram_parse_mode = get_str(merged, "TELEGRAM_PARSE_MODE", cfg.telegram_parse_mode).strip()
+        cfg.telegram_commands_enabled = get_bool(merged, "TELEGRAM_COMMANDS_ENABLED", cfg.telegram_commands_enabled)
+        cfg.telegram_command_poll_interval_seconds = get_int(merged, "TELEGRAM_COMMAND_POLL_INTERVAL_SECONDS", cfg.telegram_command_poll_interval_seconds, 1, 300)
+        cfg.telegram_allowed_chat_ids = get_str(merged, "TELEGRAM_ALLOWED_CHAT_IDS", cfg.telegram_allowed_chat_ids).strip()
+        cfg.telegram_drop_pending_updates = get_bool(merged, "TELEGRAM_DROP_PENDING_UPDATES", cfg.telegram_drop_pending_updates)
         cfg.send_startup_summary = get_bool(merged, "SEND_STARTUP_SUMMARY", cfg.send_startup_summary)
         cfg.alert_existing_errors_on_first_run = get_bool(merged, "ALERT_EXISTING_ERRORS_ON_FIRST_RUN", cfg.alert_existing_errors_on_first_run)
         cfg.redact_identifiers = get_bool(merged, "REDACT_IDENTIFIERS", cfg.redact_identifiers)
@@ -209,12 +217,113 @@ class Monitor:
         return result
 
     def daemon(self) -> None:
-        logging.info("daemon started, poll=%ss, config=%s", self.cfg.poll_interval_seconds, self.cfg.config_path)
+        logging.info(
+            "daemon started, poll=%ss, tg_commands=%s, config=%s",
+            self.cfg.poll_interval_seconds,
+            self.telegram_commands_active(),
+            self.cfg.config_path,
+        )
         # Establish a baseline immediately; notify only when configured.
         self.run_once(notify=True, include_daily=True)
+        self.bootstrap_telegram_commands()
+
+        next_monitor_at = time.monotonic() + self.cfg.poll_interval_seconds
         while True:
-            time.sleep(self.cfg.poll_interval_seconds)
-            self.run_once(notify=True, include_daily=True)
+            if self.telegram_commands_active():
+                try:
+                    self.poll_telegram_commands()
+                except Exception:
+                    logging.exception("telegram command polling failed")
+
+            now = time.monotonic()
+            if now >= next_monitor_at:
+                self.run_once(notify=True, include_daily=True)
+                next_monitor_at = time.monotonic() + self.cfg.poll_interval_seconds
+
+            if self.telegram_commands_active():
+                sleep_for = min(
+                    self.cfg.telegram_command_poll_interval_seconds,
+                    max(1.0, next_monitor_at - time.monotonic()),
+                )
+            else:
+                sleep_for = max(1.0, next_monitor_at - time.monotonic())
+            time.sleep(sleep_for)
+
+    def telegram_commands_active(self) -> bool:
+        return bool(self.cfg.telegram_commands_enabled and self.cfg.telegram_bot_token)
+
+    def bootstrap_telegram_commands(self) -> None:
+        if not self.telegram_commands_active():
+            return
+        if self.state.get("telegram_update_offset") is not None:
+            return
+        if not self.cfg.telegram_drop_pending_updates:
+            return
+        try:
+            updates = telegram_get_updates(self.cfg, offset=None, timeout_seconds=0)
+        except Exception:
+            logging.exception("failed to initialize telegram update offset")
+            return
+        if updates:
+            max_update_id = max(int(update.get("update_id") or 0) for update in updates)
+            self.state["telegram_update_offset"] = max_update_id + 1
+            self.save()
+            logging.info("dropped %s pending telegram updates during bootstrap", len(updates))
+        else:
+            self.state["telegram_update_offset"] = 0
+            self.save()
+
+    def poll_telegram_commands(self) -> None:
+        offset = self.state.get("telegram_update_offset")
+        try:
+            offset_int = int(offset) if offset is not None else None
+        except Exception:
+            offset_int = None
+        updates = telegram_get_updates(self.cfg, offset=offset_int, timeout_seconds=0)
+        if not updates:
+            return
+        max_update_id = offset_int or 0
+        for update in updates:
+            update_id = int(update.get("update_id") or 0)
+            max_update_id = max(max_update_id, update_id)
+            self.handle_telegram_update(update)
+        self.state["telegram_update_offset"] = max_update_id + 1
+        self.save()
+
+    def handle_telegram_update(self, update: dict[str, Any]) -> None:
+        message = update.get("message")
+        if not isinstance(message, dict):
+            return
+        chat = message.get("chat")
+        if not isinstance(chat, dict):
+            return
+        chat_id = str(chat.get("id") or "").strip()
+        text = str(message.get("text") or "").strip()
+        if not chat_id or not text.startswith("/"):
+            return
+        if not telegram_chat_allowed(self.cfg, chat_id):
+            logging.warning("ignored telegram command from unauthorized chat_id=%s", chat_id)
+            return
+
+        command = normalize_telegram_command(text)
+        logging.info("telegram command chat_id=%s command=%s", chat_id, command)
+        try:
+            if command in {"/start", "/help"}:
+                self.send(build_command_help(), chat_id=chat_id)
+            elif command in {"/status", "/accounts", "/account", "/summary"}:
+                rows = self.current_account_rows()
+                self.send(build_account_message(rows, [], [], [], self.cfg, title="ℹ️ sub2api 当前账号状态"), chat_id=chat_id)
+            elif command in {"/daily", "/report"}:
+                tz = self.cfg.tzinfo()
+                day = dt.datetime.now(tz).date() - dt.timedelta(days=1)
+                self.send(self.build_daily_report(day), chat_id=chat_id)
+            elif command == "/ping":
+                self.send("🏓 <b>pong</b>\n" + muted(now_iso(self.cfg.tzinfo())), chat_id=chat_id)
+            else:
+                self.send(build_unknown_command(command), chat_id=chat_id)
+        except Exception:
+            logging.exception("telegram command handling failed: %s", command)
+            self.send(build_simple_alert("⚠️ Telegram 命令执行失败", short_exc(), self.cfg), chat_id=chat_id)
 
     def query_json(self, sql: str) -> Any:
         raw = self.psql(sql)
@@ -518,8 +627,8 @@ SELECT json_build_object(
 """
         return self.query_json(sql) or {"summary": {}, "by_plan": [], "top_models": []}
 
-    def send(self, text: str) -> None:
-        send_telegram(self.cfg, text, dry_run=self.dry_run)
+    def send(self, text: str, chat_id: str | None = None) -> None:
+        send_telegram(self.cfg, text, dry_run=self.dry_run, chat_id=chat_id)
 
 
 # ----------------------------- formatting helpers -----------------------------
@@ -866,34 +975,93 @@ def error_key(row: dict[str, Any]) -> str:
 # ------------------------------- telegram ------------------------------------
 
 
-def send_telegram(cfg: Config, text: str, dry_run: bool = False) -> None:
+def send_telegram(cfg: Config, text: str, dry_run: bool = False, chat_id: str | None = None) -> None:
+    target_chat_id = str(chat_id or cfg.telegram_chat_id or "").strip()
     chunks = split_message(text)
-    if dry_run or not (cfg.telegram_bot_token and cfg.telegram_chat_id):
+    if dry_run or not (cfg.telegram_bot_token and target_chat_id):
         prefix = "[dry-run telegram]" if dry_run else "[telegram disabled: missing TELEGRAM_BOT_TOKEN/CHAT_ID]"
         for chunk in chunks:
-            logging.info("%s message_len=%s", prefix, len(chunk))
-            print(f"{prefix}\n{render_for_terminal(chunk)}\n")
+            logging.info("%s chat_id=%s message_len=%s", prefix, target_chat_id or "-", len(chunk))
+            print(f"{prefix} chat_id={target_chat_id or '-'}\n{render_for_terminal(chunk)}\n")
         return
     for chunk in chunks:
-        url = f"{cfg.telegram_api_base}/bot{cfg.telegram_bot_token}/sendMessage"
         payload = {
-            "chat_id": cfg.telegram_chat_id,
+            "chat_id": target_chat_id,
             "text": chunk,
             "disable_web_page_preview": "true" if cfg.telegram_disable_web_page_preview else "false",
         }
         if cfg.telegram_parse_mode:
             payload["parse_mode"] = cfg.telegram_parse_mode
-        data = urllib.parse.urlencode(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-                if resp.status >= 300:
-                    raise RuntimeError(f"telegram HTTP {resp.status}: {body[:300]}")
-                logging.info("telegram sent: %s bytes", len(chunk.encode("utf-8")))
+            telegram_api_request(cfg, "sendMessage", payload, timeout_seconds=20)
+            logging.info("telegram sent: %s bytes to chat_id=%s", len(chunk.encode("utf-8")), target_chat_id)
         except Exception as exc:
             logging.error("telegram send failed: %s", exc)
             raise
+
+
+def telegram_get_updates(cfg: Config, offset: int | None, timeout_seconds: int = 0) -> list[dict[str, Any]]:
+    payload: dict[str, Any] = {
+        "timeout": str(max(0, int(timeout_seconds))),
+        "allowed_updates": json.dumps(["message"]),
+    }
+    if offset is not None and offset > 0:
+        payload["offset"] = str(offset)
+    data = telegram_api_request(cfg, "getUpdates", payload, timeout_seconds=max(10, timeout_seconds + 10))
+    result = data.get("result")
+    if not isinstance(result, list):
+        return []
+    return [update for update in result if isinstance(update, dict)]
+
+
+def telegram_api_request(cfg: Config, method: str, payload: dict[str, Any], timeout_seconds: int = 20) -> dict[str, Any]:
+    if not cfg.telegram_bot_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    url = f"{cfg.telegram_api_base}/bot{cfg.telegram_bot_token}/{method}"
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    parsed = json.loads(body)
+    if not parsed.get("ok"):
+        description = parsed.get("description") or "unknown telegram error"
+        raise RuntimeError(f"telegram {method} failed: {description}")
+    return parsed
+
+
+def normalize_telegram_command(text: str) -> str:
+    first = text.strip().split()[0].lower()
+    if "@" in first:
+        first = first.split("@", 1)[0]
+    return first
+
+
+def telegram_allowed_chat_id_set(cfg: Config) -> set[str]:
+    raw = cfg.telegram_allowed_chat_ids or cfg.telegram_chat_id
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def telegram_chat_allowed(cfg: Config, chat_id: str) -> bool:
+    allowed = telegram_allowed_chat_id_set(cfg)
+    return "*" in allowed or chat_id in allowed
+
+
+def build_command_help() -> str:
+    return "\n".join([
+        "🤖 <b>Sub2API Monitor</b>",
+        "",
+        f"{tg_code('/status')} 当前账号状态",
+        f"{tg_code('/daily')} 昨日/今日用量日报",
+        f"{tg_code('/ping')} 检查 bot 是否在线",
+        f"{tg_code('/help')} 显示帮助",
+    ])
+
+
+def build_unknown_command(command: str) -> str:
+    return "\n".join([
+        h(f"未知命令：{command}"),
+        h("发送 /help 查看可用命令。"),
+    ])
 
 
 # -------------------------------- utilities -----------------------------------
