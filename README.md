@@ -113,7 +113,7 @@ Most users start with options 1-5 and 10; use option 13 when you want guided con
 
 | Option | Use it for | Notes |
 | --- | --- | --- |
-| 1 | Install or update from GitHub | Pulls the latest project files and keeps your existing config. |
+| 1 | Install or update from GitHub | Pulls the latest project files, keeps your existing config, then reloads the new menu. |
 | 2 | Configure Telegram notifications | Saves bot token/chat ID in `/etc/sub2api-monitor/config.env`. |
 | 3 | Test Telegram notifications | Verifies the bot can send messages. |
 | 4 | View account status locally | Prints status only; does not send Telegram. |

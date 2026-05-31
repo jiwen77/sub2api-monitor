@@ -392,7 +392,18 @@ menu() {
     echo
     read -r -p "请选择: " choice
     case "$choice" in
-      1) update_from_github; pause ;;
+      1)
+        if update_from_github; then
+          echo
+          echo -e "${green}已更新。按 Enter 进入新版菜单...${reset}"
+          pause
+          if [[ -x "$INSTALL_DIR/monitor.sh" ]]; then
+            exec "$INSTALL_DIR/monitor.sh"
+          fi
+          echo -e "${yellow}未找到新版菜单脚本，请退出后重新运行。${reset}"
+        fi
+        pause
+        ;;
       2) configure_tg; pause ;;
       3) run_py test-telegram; pause ;;
       4) run_py account-summary; pause ;;
