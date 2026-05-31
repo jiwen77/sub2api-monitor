@@ -38,15 +38,29 @@ set_env_value() {
   fi
 }
 
+same_file() {
+  local src="$1" dst="$2"
+  [[ -e "$src" && -e "$dst" ]] || return 1
+  [[ "$(readlink -f "$src")" == "$(readlink -f "$dst")" ]]
+}
+
+install_or_chmod() {
+  local mode="$1" src="$2" dst="$3"
+  if same_file "$src" "$dst"; then
+    chmod "$mode" "$dst"
+  else
+    install -m "$mode" "$src" "$dst"
+  fi
+}
+
 install_files() {
   need_root "$@"
   echo -e "${blue}安装/更新本地项目文件到 $INSTALL_DIR${reset}"
-  mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR"
-  install -m 0755 "$SRC_DIR/sub2api_monitor.py" "$INSTALL_DIR/sub2api_monitor.py"
-  install -m 0755 "$SRC_DIR/monitor.sh" "$INSTALL_DIR/monitor.sh"
-  install -m 0644 "$SRC_DIR/README.md" "$INSTALL_DIR/README.md"
-  mkdir -p "$INSTALL_DIR/systemd"
-  install -m 0644 "$SRC_DIR/systemd/sub2api-monitor.service" "$INSTALL_DIR/systemd/sub2api-monitor.service"
+  mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR" "$INSTALL_DIR/systemd"
+  install_or_chmod 0755 "$SRC_DIR/sub2api_monitor.py" "$INSTALL_DIR/sub2api_monitor.py"
+  install_or_chmod 0755 "$SRC_DIR/monitor.sh" "$INSTALL_DIR/monitor.sh"
+  install_or_chmod 0644 "$SRC_DIR/README.md" "$INSTALL_DIR/README.md"
+  install_or_chmod 0644 "$SRC_DIR/systemd/sub2api-monitor.service" "$INSTALL_DIR/systemd/sub2api-monitor.service"
   if [[ ! -f "$CONFIG_FILE" ]]; then
     install -m 0600 "$SRC_DIR/config.env.example" "$CONFIG_FILE"
     echo -e "${green}已创建配置：$CONFIG_FILE${reset}"
