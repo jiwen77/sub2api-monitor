@@ -109,7 +109,7 @@ sudo UPDATE_REPO_URL=https://github.com/yourname/sub2api-monitor.git \
 
 ## Menu option guide
 
-Most users only need options 1-5 and 10-12:
+Most users start with options 1-5 and 10; use option 13 when you want guided configuration changes:
 
 | Option | Use it for | Notes |
 | --- | --- | --- |
@@ -125,8 +125,9 @@ Most users only need options 1-5 and 10-12:
 | 10 | Start/restart background monitoring | Recommended production mode; keeps running after SSH disconnects and after reboot. |
 | 11 | View background monitor status/logs | Useful when checking whether it is running normally. |
 | 12 | Stop background monitoring and disable autostart | Use this when you do not want automatic alerts anymore. |
-| 13 | Edit config file | Opens `/etc/sub2api-monitor/config.env`. |
-| 14 | Uninstall program files | Keeps config/state by default. |
+| 13 | Change common settings interactively | Guided prompts for polling, Telegram commands, alerts, daily reports, and Sub2API/Postgres paths. |
+| 14 | Manually edit config file | Opens `/etc/sub2api-monitor/config.env` in `nano` or `$EDITOR`. |
+| 15 | Uninstall program files | Keeps config/state by default. |
 
 ## Telegram commands
 
@@ -202,6 +203,8 @@ Important options:
 | `REDACT_IDENTIFIERS` | `true` | Redact account names/emails in alerts. |
 | `DAILY_REPORT_HOUR` | `0` | Local hour for daily report. |
 | `DAILY_REPORT_MINUTE` | `0` | Local minute for daily report. |
+
+You can edit these with menu option `13) 交互式修改配置项`; option `14) 手动编辑配置文件（nano）` remains available for advanced/manual edits.
 
 See [`config.env.example`](./config.env.example) for the full set of options.
 
