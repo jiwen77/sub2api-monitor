@@ -152,15 +152,16 @@ install_service() {
   install_files
   install -m 0644 "$INSTALL_DIR/systemd/sub2api-monitor.service" "$SERVICE_FILE"
   systemctl daemon-reload
-  systemctl enable --now sub2api-monitor.service
-  echo -e "${green}systemd 服务已启动。${reset}"
+  systemctl enable sub2api-monitor.service
+  systemctl restart sub2api-monitor.service
+  echo -e "${green}后台监控服务已启动/重启。${reset}"
   systemctl --no-pager --full status sub2api-monitor.service || true
 }
 
 stop_service() {
   need_root "$@"
   systemctl disable --now sub2api-monitor.service || true
-  echo -e "${green}服务已停止并禁用。${reset}"
+  echo -e "${green}后台监控服务已停止并禁用。${reset}"
 }
 
 show_status() {
@@ -197,20 +198,20 @@ menu() {
     echo "安装目录: $INSTALL_DIR"
     echo "配置文件: $CONFIG_FILE"
     echo
-    echo " 1) 从 GitHub 安装/更新项目文件"
-    echo " 2) 配置 Telegram"
-    echo " 3) 发送 Telegram 测试"
-    echo " 4) 查看当前账号状态（不通知）"
-    echo " 5) 强制推送当前账号状态快照"
-    echo " 6) 手动巡检一次（仅变化/上游错误才告警）"
-    echo " 7) 生成日报（不通知）"
-    echo " 8) 立即发送日报"
-    echo " 9) 前台运行 daemon"
-    echo "10) 安装并启动 systemd 服务"
-    echo "11) 查看服务状态/日志"
-    echo "12) 停止并禁用服务"
-    echo "13) 编辑配置"
-    echo "14) 卸载程序文件"
+    echo " 1) 安装/更新程序（从 GitHub 拉取）"
+    echo " 2) 配置 Telegram 通知"
+    echo " 3) 测试 Telegram 通知"
+    echo " 4) 查看账号状态（只显示，不发 TG）"
+    echo " 5) 发送账号状态到 TG（立即发送）"
+    echo " 6) 手动检查告警（有变化/错误才发 TG）"
+    echo " 7) 预览日报（只显示，不发 TG）"
+    echo " 8) 发送日报到 TG（立即发送）"
+    echo " 9) 临时运行监控（关窗口会停止）"
+    echo "10) 后台启动/重启监控（推荐）"
+    echo "11) 查看后台监控状态/日志"
+    echo "12) 停止后台监控并关闭自启"
+    echo "13) 编辑配置文件"
+    echo "14) 卸载程序文件（保留配置）"
     echo " 0) 退出"
     echo
     read -r -p "请选择: " choice

@@ -62,12 +62,12 @@ sudo bash /tmp/sub2api-monitor.sh
 
 Recommended first-run flow:
 
-1. `从 GitHub 安装/更新项目文件`
-2. `配置 Telegram`
-3. `发送 Telegram 测试`
-4. `查看当前账号状态（不通知）`
-5. `强制推送当前账号状态快照`
-6. `安装并启动 systemd 服务`
+1. `安装/更新程序（从 GitHub 拉取）`
+2. `配置 Telegram 通知`
+3. `测试 Telegram 通知`
+4. `查看账号状态（只显示，不发 TG）`
+5. `发送账号状态到 TG（立即发送）`
+6. `后台启动/重启监控（推荐）`
 
 After installation, open the menu with:
 
@@ -107,10 +107,26 @@ sudo UPDATE_REPO_URL=https://github.com/yourname/sub2api-monitor.git \
 
 
 
-## Menu option 5 vs 6
+## Menu option guide
 
-- Option 5, `强制推送当前账号状态快照`: always sends the current account summary to Telegram. Use it when you just want to look at the current account state.
-- Option 6, `手动巡检一次（仅变化/上游错误才告警）`: runs one normal monitoring cycle. It sends Telegram only when account state changed or a qualifying upstream error is found. Use it to test the alerting rules without starting the daemon.
+Most users only need options 1-5 and 10-12:
+
+| Option | Use it for | Notes |
+| --- | --- | --- |
+| 1 | Install or update from GitHub | Pulls the latest project files and keeps your existing config. |
+| 2 | Configure Telegram notifications | Saves bot token/chat ID in `/etc/sub2api-monitor/config.env`. |
+| 3 | Test Telegram notifications | Verifies the bot can send messages. |
+| 4 | View account status locally | Prints status only; does not send Telegram. |
+| 5 | Send account status to Telegram now | Always sends the current snapshot. |
+| 6 | Run alert checks once | Sends Telegram only if account state changed or upstream errors are found. |
+| 7 | Preview daily report locally | Prints the report only. |
+| 8 | Send daily report to Telegram now | Always sends the current daily report. |
+| 9 | Run monitor temporarily in the foreground | Mainly for debugging; closing SSH stops it. |
+| 10 | Start/restart background monitoring | Recommended production mode; keeps running after SSH disconnects and after reboot. |
+| 11 | View background monitor status/logs | Useful when checking whether it is running normally. |
+| 12 | Stop background monitoring and disable autostart | Use this when you do not want automatic alerts anymore. |
+| 13 | Edit config file | Opens `/etc/sub2api-monitor/config.env`. |
+| 14 | Uninstall program files | Keeps config/state by default. |
 
 ## Telegram commands
 
