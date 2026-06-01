@@ -1,5 +1,5 @@
 [Unit]
-Description=Passive Sub2API account/upstream/usage monitor with Telegram alerts
+Description=Passive Sub2API account/recharge/upstream/usage monitor with Telegram alerts
 Wants=network-online.target docker.service
 After=network-online.target docker.service
 

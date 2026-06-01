@@ -219,6 +219,7 @@ print_config_summary() {
   echo "启动时发送账号基线: $(get_env_value SEND_STARTUP_SUMMARY true)"
   echo "账号信息脱敏: $(get_env_value REDACT_IDENTIFIERS true)"
   echo "每条消息最多展开: $(get_env_value DETAIL_LIMIT 12) 条"
+  echo "用户充值通知: $(get_env_value USER_RECHARGE_ALERTS_ENABLED true)"
   echo "TG 命令开关: $(get_env_value TELEGRAM_COMMANDS_ENABLED true)"
   echo "TG 命令检查频率: $(get_env_value TELEGRAM_COMMAND_POLL_INTERVAL_SECONDS 5) 秒"
   echo "TG 命令允许 Chat IDs: $(get_env_value TELEGRAM_ALLOWED_CHAT_IDS '')"
@@ -273,7 +274,7 @@ configure_runtime_options() {
     echo " 1) 查看当前常用配置"
     echo " 2) 监控频率/时区"
     echo " 3) Telegram 命令设置（/status 等）"
-    echo " 4) 账号告警显示设置"
+    echo " 4) 账号/充值告警显示设置"
     echo " 5) 上游错误告警设置"
     echo " 6) 日报时间设置"
     echo " 7) Sub2API / 数据库连接设置"
@@ -296,6 +297,7 @@ configure_runtime_options() {
         prompt_bool SEND_STARTUP_SUMMARY "监控启动/重启时是否发送账号基线" true
         prompt_bool REDACT_IDENTIFIERS "TG 消息里是否隐藏账号邮箱/名称" true
         prompt_int DETAIL_LIMIT "每条消息最多展开多少个账号/错误" 12 1 100
+        prompt_bool USER_RECHARGE_ALERTS_ENABLED "是否在用户充值时推送 TG 通知" true
         ;;
       5)
         prompt_int ERROR_LOOKBACK_MINUTES "每轮检查最近多少分钟内的上游错误" 30 1 1440

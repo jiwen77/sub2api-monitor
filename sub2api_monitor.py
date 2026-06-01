@@ -4,6 +4,7 @@
 This monitor intentionally does NOT probe upstream APIs. It only reads Sub2API's
 own PostgreSQL tables (accounts, ops_error_logs, usage_logs) and reports:
 - account availability/state changes;
+- user recharge increases;
 - provider/upstream errors already observed by Sub2API;
 - daily usage summaries.
 """
@@ -25,6 +26,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -80,6 +82,7 @@ class Config:
     alert_existing_errors_on_first_run: bool = False
     redact_identifiers: bool = True
     detail_limit: int = 12
+    user_recharge_alerts_enabled: bool = True
     error_lookback_minutes: int = 30
     error_limit_per_poll: int = 500
     error_cooldown_seconds: int = 600
@@ -119,7 +122,7 @@ class Config:
         sub_env_path = Path(sub2api_dir) / ".env"
         sub_env = read_env_file(sub_env_path) if sub_env_path.exists() else {}
 
-        merged = {**sub_env, **env, **{k: v for k, v in os.environ.items() if k.startswith(("SUB2API_", "POSTGRES_", "TELEGRAM_"))}}
+        merged = {**sub_env, **env, **{k: v for k, v in os.environ.items() if k.startswith(("SUB2API_", "POSTGRES_", "TELEGRAM_", "USER_RECHARGE_"))}}
         cfg = cls()
         cfg.config_path = chosen
         cfg.sub2api_dir = get_str(merged, "SUB2API_DIR", cfg.sub2api_dir)
@@ -145,6 +148,7 @@ class Config:
         cfg.alert_existing_errors_on_first_run = get_bool(merged, "ALERT_EXISTING_ERRORS_ON_FIRST_RUN", cfg.alert_existing_errors_on_first_run)
         cfg.redact_identifiers = get_bool(merged, "REDACT_IDENTIFIERS", cfg.redact_identifiers)
         cfg.detail_limit = get_int(merged, "DETAIL_LIMIT", cfg.detail_limit, 1, 100)
+        cfg.user_recharge_alerts_enabled = get_bool(merged, "USER_RECHARGE_ALERTS_ENABLED", cfg.user_recharge_alerts_enabled)
         cfg.error_lookback_minutes = get_int(merged, "ERROR_LOOKBACK_MINUTES", cfg.error_lookback_minutes, 1, 1440)
         cfg.error_limit_per_poll = get_int(merged, "ERROR_LIMIT_PER_POLL", cfg.error_limit_per_poll, 1, 5000)
         cfg.error_cooldown_seconds = get_int(merged, "ERROR_COOLDOWN_SECONDS", cfg.error_cooldown_seconds, 0, 86400)
@@ -171,6 +175,7 @@ class Config:
 @dataclass
 class MonitorResult:
     account_message: str | None = None
+    recharge_message: str | None = None
     error_message: str | None = None
     daily_message: str | None = None
     changed: bool = False
@@ -186,6 +191,7 @@ class Monitor:
         self.state = load_state(Path(self.cfg.state_file))
         self.state.setdefault("version", 1)
         self.state.setdefault("accounts", {})
+        self.state.setdefault("user_recharges", {})
         self.state.setdefault("last_error_id", 0)
         self.state.setdefault("error_cooldowns", {})
         self.allowed_status = parse_allowed_status(self.cfg.upstream_allowed_status_codes)
@@ -208,6 +214,19 @@ class Monitor:
         except Exception:
             logging.exception("account check failed")
             msg = build_simple_alert("⚠️ 账号状态检查失败", short_exc(), self.cfg)
+            if notify:
+                self.send(msg)
+
+        try:
+            recharge_msg = self.check_user_recharges()
+            if recharge_msg:
+                result.recharge_message = recharge_msg
+                result.changed = True
+                if notify:
+                    self.send(recharge_msg)
+        except Exception:
+            logging.exception("user recharge check failed")
+            msg = build_simple_alert("⚠️ 用户充值检查失败", short_exc(), self.cfg)
             if notify:
                 self.send(msg)
 
@@ -488,6 +507,59 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
             include_abnormal=False,
         )
 
+    def current_user_recharge_rows(self) -> list[dict[str, Any]]:
+        sql = """
+WITH rows AS (
+  SELECT
+    id,
+    coalesce(email, '') AS email,
+    coalesce(username, '') AS username,
+    coalesce(role, '') AS role,
+    coalesce(status, '') AS status,
+    coalesce(balance, 0)::numeric(30,8)::text AS balance,
+    coalesce(total_recharged, 0)::numeric(30,8)::text AS total_recharged,
+    created_at,
+    updated_at
+  FROM users
+  WHERE deleted_at IS NULL
+  ORDER BY id
+)
+SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
+"""
+        return self.query_json(sql) or []
+
+    def check_user_recharges(self) -> str | None:
+        if not self.cfg.user_recharge_alerts_enabled:
+            return None
+        rows = self.current_user_recharge_rows()
+        now = now_iso(self.cfg.tzinfo())
+        prev: dict[str, Any] = self.state.get("user_recharges") or {}
+        initialized = bool(self.state.get("user_recharges_initialized"))
+        current = {str(r["id"]): user_recharge_digest(r) for r in rows}
+        self.state["user_recharges"] = current
+        self.state["user_recharges_updated_at"] = now
+        self.state["user_recharges_initialized"] = True
+
+        if not initialized:
+            return None
+
+        by_id = rows_by_id(rows)
+        recharges: list[dict[str, Any]] = []
+        for uid in sorted(current.keys(), key=lambda x: int(x) if x.isdigit() else x):
+            previous_total = decimal_value((prev.get(uid) or {}).get("total_recharged"))
+            current_total = decimal_value(current[uid].get("total_recharged"))
+            if current_total <= previous_total:
+                continue
+            row = dict(by_id[uid])
+            row["_previous_total_recharged"] = decimal_string(previous_total)
+            row["_recharge_delta"] = decimal_string(current_total - previous_total)
+            recharges.append(row)
+
+        if not recharges:
+            return None
+        recharges.sort(key=lambda r: decimal_value(r.get("_recharge_delta")), reverse=True)
+        return build_user_recharge_message(recharges, self.cfg)
+
     def max_ops_error_id(self) -> int:
         sql = "SELECT coalesce(max(id),0)::bigint FROM ops_error_logs;"
         out = self.psql(sql).strip()
@@ -730,6 +802,16 @@ def account_digest(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def user_recharge_digest(row: dict[str, Any]) -> dict[str, Any]:
+    # Keep the persisted state non-sensitive: only numeric baselines are needed
+    # to detect future recharge increases.
+    return {
+        "id": row.get("id"),
+        "balance": decimal_string(row.get("balance")),
+        "total_recharged": decimal_string(row.get("total_recharged")),
+    }
+
+
 def rows_by_id(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {str(r.get("id")): r for r in rows}
 
@@ -810,6 +892,40 @@ def build_account_message(
             lines.append(format_account_row(row, cfg))
         if len(abnormal) > cfg.detail_limit:
             lines.append(muted(f"另有 {len(abnormal) - cfg.detail_limit} 个非正常账号未展开"))
+    return clamp_message("\n".join(lines))
+
+
+def build_user_recharge_message(rows: list[dict[str, Any]], cfg: Config) -> str:
+    total_delta = sum((decimal_value(row.get("_recharge_delta")) for row in rows), Decimal("0"))
+    lines = [
+        "💰 <b>Sub2API 用户充值</b>",
+        muted(now_iso(cfg.tzinfo())),
+        h(f"新增 {len(rows)} 笔 / 合计 +{fmt_amount(total_delta)}"),
+        "",
+        section("充值明细"),
+    ]
+    for row in rows[: cfg.detail_limit]:
+        ident = tg_code(f"#{row.get('id')}")
+        name = display_user_identifier(row, cfg)
+        meta_bits = [str(row.get("role") or "").strip(), str(row.get("status") or "").strip()]
+        meta = ", ".join(bit for bit in meta_bits if bit)
+        head_bits = ["•", ident]
+        if name:
+            head_bits.append(h(name))
+        if meta:
+            head_bits.append(h(f"({meta})"))
+        lines.append(" ".join(head_bits))
+
+        detail = (
+            f"充值：+{fmt_amount(row.get('_recharge_delta'))}"
+            f" · 累计：{fmt_amount(row.get('total_recharged'))}"
+            f" · 余额：{fmt_amount(row.get('balance'))}"
+        )
+        lines.append(f"  {h(detail)}")
+        if row.get("updated_at"):
+            lines.append(f"  {h('更新时间：' + short_time(row.get('updated_at')))}")
+    if len(rows) > cfg.detail_limit:
+        lines.append(muted(f"另有 {len(rows) - cfg.detail_limit} 笔充值未展开"))
     return clamp_message("\n".join(lines))
 
 
@@ -988,6 +1104,10 @@ def display_identifier(row: dict[str, Any], cfg: Config) -> str:
             return "***"
         return f"{raw[:2]}***{raw[-2:]}"
     return raw
+
+
+def display_user_identifier(row: dict[str, Any], cfg: Config) -> str:
+    return display_identifier({"email": row.get("email"), "name": row.get("username")}, cfg)
 
 
 def group_error_rows(
@@ -1521,6 +1641,25 @@ def fmt_money(value: Any) -> str:
         return "0.000000"
 
 
+def decimal_value(value: Any) -> Decimal:
+    if value in (None, ""):
+        return Decimal("0")
+    try:
+        return Decimal(str(value).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+
+
+def decimal_string(value: Any) -> str:
+    return format(decimal_value(value), "f")
+
+
+def fmt_amount(value: Any) -> str:
+    value_dec = decimal_value(value)
+    text = f"{value_dec:,.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -1633,6 +1772,8 @@ def main(argv: list[str] | None = None) -> int:
             "postgres_db": cfg.postgres_db,
             "state_file": cfg.state_file,
             "account_summary": summary_lines,
+            "user_recharge_alerts_enabled": cfg.user_recharge_alerts_enabled,
+            "user_recharges_initialized": mon.state.get("user_recharges_initialized"),
             "last_error_id": mon.state.get("last_error_id"),
         }, ensure_ascii=False, indent=2))
         return 0

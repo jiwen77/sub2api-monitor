@@ -1,4 +1,5 @@
 import datetime as dt
+import tempfile
 import unittest
 
 import sub2api_monitor as m
@@ -192,6 +193,79 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("状态：限流至 06-05 12:49 → 正常", message)
         self.assertIn("当前用量：5h 100.0% · 7d 46.0%", message)
         self.assertNotIn("当前需要关注", message)
+
+    def test_user_recharge_message_redacts_and_summarizes(self):
+        cfg = m.Config()
+        message = m.build_user_recharge_message(
+            [
+                {
+                    "id": 9,
+                    "email": "28abcd@qq.com",
+                    "username": "member",
+                    "role": "user",
+                    "status": "active",
+                    "balance": "32.90506360",
+                    "total_recharged": "1060.00000000",
+                    "updated_at": "2026-06-01 12:10:14+08",
+                    "_recharge_delta": "50.00000000",
+                }
+            ],
+            cfg,
+        )
+
+        self.assertIn("用户充值", message)
+        self.assertIn("新增 1 笔 / 合计 +50", message)
+        self.assertIn("#9", message)
+        self.assertIn("28***@qq***", message)
+        self.assertIn("(user, active)", message)
+        self.assertIn("充值：+50 · 累计：1,060 · 余额：32.905064", message)
+        self.assertNotIn("28abcd@qq.com", message)
+
+    def test_user_recharge_check_baselines_then_alerts_increases(self):
+        class FakeMonitor(m.Monitor):
+            def __init__(self, cfg, snapshots):
+                self.snapshots = list(snapshots)
+                super().__init__(cfg, dry_run=True)
+
+            def current_user_recharge_rows(self):
+                return self.snapshots.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = m.Config(state_file=f"{tmp}/state.json")
+            mon = FakeMonitor(
+                cfg,
+                [
+                    [
+                        {
+                            "id": 6,
+                            "email": "downstream@example.com",
+                            "username": "",
+                            "role": "user",
+                            "status": "active",
+                            "balance": "10.00000000",
+                            "total_recharged": "100.00000000",
+                        }
+                    ],
+                    [
+                        {
+                            "id": 6,
+                            "email": "downstream@example.com",
+                            "username": "",
+                            "role": "user",
+                            "status": "active",
+                            "balance": "35.00000000",
+                            "total_recharged": "125.00000000",
+                        }
+                    ],
+                ],
+            )
+
+            self.assertIsNone(mon.check_user_recharges())
+            message = mon.check_user_recharges()
+
+        self.assertIn("用户充值", message)
+        self.assertIn("充值：+25", message)
+        self.assertIn("累计：125", message)
 
     def test_telegram_bot_commands_are_valid_for_api(self):
         for command in m.TELEGRAM_BOT_COMMANDS:

@@ -13,6 +13,11 @@ A passive monitoring and Telegram alerting tool for [Sub2API](https://github.com
   - Reports state changes for active/error/rate-limited/overloaded/temporarily-unschedulable/expired accounts.
   - Redacts account identifiers by default.
 
+- **User recharge alerts**
+  - Reads Sub2API `users.total_recharged`.
+  - Sends a Telegram notification when a user's cumulative recharge amount increases.
+  - Shows the recharge delta, current cumulative recharge, current balance, and a redacted user identifier.
+
 - **Upstream and exit-network error alerts**
   - Reads Sub2API `ops_error_logs`.
   - Defaults to provider/upstream `429` and `5xx` alerts.
@@ -121,7 +126,7 @@ Most users start with options 1-5 and 10; use option 13 when you want guided con
 | 3 | Test Telegram notifications | Verifies the bot can send messages. |
 | 4 | View account status locally | Prints status only; does not send Telegram. |
 | 5 | Send account status to Telegram now | Always sends the current snapshot. |
-| 6 | Run alert checks once | Sends Telegram only if account state changed or upstream errors are found. |
+| 6 | Run alert checks once | Sends Telegram only if account state changed, a user recharge is found, or upstream errors are found. |
 | 7 | Preview daily report locally | Prints the report only. |
 | 8 | Send daily report to Telegram now | Always sends the current daily report. |
 | 9 | Run monitor temporarily in the foreground | Mainly for debugging; closing SSH stops it. |
@@ -168,7 +173,7 @@ python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/co
 # Force-send the current account snapshot to Telegram.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env account-summary --notify
 
-# Run the same alert rules once: account changes and upstream errors only.
+# Run the same alert rules once: account changes, user recharges, and upstream errors.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env run-once --notify
 
 # Force-send the daily usage report.
@@ -210,6 +215,7 @@ Important options:
 | `TELEGRAM_COMMAND_POLL_INTERVAL_SECONDS` | `5` | How often daemon mode checks Telegram commands. |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | empty | Optional comma-separated allowlist; defaults to `TELEGRAM_CHAT_ID`. |
 | `POLL_INTERVAL_SECONDS` | `60` | Daemon polling interval. |
+| `USER_RECHARGE_ALERTS_ENABLED` | `true` | Send Telegram notifications when `users.total_recharged` increases. |
 | `ERROR_LOOKBACK_MINUTES` | `30` | Lookback window for new upstream errors. |
 | `ERROR_COOLDOWN_SECONDS` | `600` | Per-error-group cooldown. |
 | `UPSTREAM_ALLOWED_STATUS_CODES` | `429,500-599` | Upstream HTTP statuses that should alert. |
