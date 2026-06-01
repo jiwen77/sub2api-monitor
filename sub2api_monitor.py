@@ -439,44 +439,64 @@ class Monitor:
 
     def current_account_rows(self) -> list[dict[str, Any]]:
         sql = """
-WITH rows AS (
+WITH account_group_rows AS (
   SELECT
-    id,
-    platform,
-    type,
-    coalesce(nullif(credentials->>'plan_type',''), nullif(extra->>'plan_type',''), type, 'unknown') AS plan,
-    status,
-    schedulable,
-    (rate_limit_reset_at IS NOT NULL AND rate_limit_reset_at > now()) AS rate_limited,
-    rate_limit_reset_at,
-    (overload_until IS NOT NULL AND overload_until > now()) AS overloaded,
-    overload_until,
-    (temp_unschedulable_until IS NOT NULL AND temp_unschedulable_until > now()) AS temp_unschedulable,
-    temp_unschedulable_until,
-    coalesce(temp_unschedulable_reason, '') AS temp_unschedulable_reason,
-    (auto_pause_on_expired AND expires_at IS NOT NULL AND expires_at <= now()) AS expired,
-    expires_at,
-    coalesce(error_message, '') AS error_message,
-    last_used_at,
-    updated_at,
-    name,
-    coalesce(credentials->>'email', extra->>'email', '') AS email,
-    CASE WHEN (extra->>'codex_5h_used_percent') ~ '^-?[0-9]+(\\.[0-9]+)?$'
-      THEN round((extra->>'codex_5h_used_percent')::numeric, 2) ELSE NULL END AS codex_5h_used_percent,
-    CASE WHEN (extra->>'codex_7d_used_percent') ~ '^-?[0-9]+(\\.[0-9]+)?$'
-      THEN round((extra->>'codex_7d_used_percent')::numeric, 2) ELSE NULL END AS codex_7d_used_percent,
+    ag.account_id,
+    json_agg(
+      json_build_object(
+        'id', g.id,
+        'name', coalesce(g.name, ''),
+        'status', coalesce(g.status, ''),
+        'platform', coalesce(g.platform, ''),
+        'subscription_type', coalesce(g.subscription_type, ''),
+        'priority', ag.priority
+      )
+      ORDER BY coalesce(ag.priority, 0) DESC, coalesce(g.sort_order, 0) ASC, g.id ASC
+    ) AS groups
+  FROM account_groups ag
+  JOIN groups g ON g.id = ag.group_id
+  WHERE g.deleted_at IS NULL
+  GROUP BY ag.account_id
+), rows AS (
+  SELECT
+    a.id,
+    a.platform,
+    a.type,
+    coalesce(nullif(a.credentials->>'plan_type',''), nullif(a.extra->>'plan_type',''), a.type, 'unknown') AS plan,
+    a.status,
+    a.schedulable,
+    (a.rate_limit_reset_at IS NOT NULL AND a.rate_limit_reset_at > now()) AS rate_limited,
+    a.rate_limit_reset_at,
+    (a.overload_until IS NOT NULL AND a.overload_until > now()) AS overloaded,
+    a.overload_until,
+    (a.temp_unschedulable_until IS NOT NULL AND a.temp_unschedulable_until > now()) AS temp_unschedulable,
+    a.temp_unschedulable_until,
+    coalesce(a.temp_unschedulable_reason, '') AS temp_unschedulable_reason,
+    (a.auto_pause_on_expired AND a.expires_at IS NOT NULL AND a.expires_at <= now()) AS expired,
+    a.expires_at,
+    coalesce(a.error_message, '') AS error_message,
+    a.last_used_at,
+    a.updated_at,
+    a.name,
+    coalesce(a.credentials->>'email', a.extra->>'email', '') AS email,
+    coalesce(agr.groups, '[]'::json) AS groups,
+    CASE WHEN (a.extra->>'codex_5h_used_percent') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      THEN round((a.extra->>'codex_5h_used_percent')::numeric, 2) ELSE NULL END AS codex_5h_used_percent,
+    CASE WHEN (a.extra->>'codex_7d_used_percent') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+      THEN round((a.extra->>'codex_7d_used_percent')::numeric, 2) ELSE NULL END AS codex_7d_used_percent,
     CASE
-      WHEN status = 'active'
-       AND schedulable IS TRUE
-       AND NOT (rate_limit_reset_at IS NOT NULL AND rate_limit_reset_at > now())
-       AND NOT (overload_until IS NOT NULL AND overload_until > now())
-       AND NOT (temp_unschedulable_until IS NOT NULL AND temp_unschedulable_until > now())
-       AND NOT (auto_pause_on_expired AND expires_at IS NOT NULL AND expires_at <= now())
+      WHEN a.status = 'active'
+       AND a.schedulable IS TRUE
+       AND NOT (a.rate_limit_reset_at IS NOT NULL AND a.rate_limit_reset_at > now())
+       AND NOT (a.overload_until IS NOT NULL AND a.overload_until > now())
+       AND NOT (a.temp_unschedulable_until IS NOT NULL AND a.temp_unschedulable_until > now())
+       AND NOT (a.auto_pause_on_expired AND a.expires_at IS NOT NULL AND a.expires_at <= now())
       THEN true ELSE false
     END AS normal
-  FROM accounts
-  WHERE deleted_at IS NULL
-  ORDER BY platform, plan, id
+  FROM accounts a
+  LEFT JOIN account_group_rows agr ON agr.account_id = a.id
+  WHERE a.deleted_at IS NULL
+  ORDER BY a.platform, plan, a.id
 )
 SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
 """
@@ -507,7 +527,7 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
         changed: list[dict[str, Any]] = []
         by_id = rows_by_id(rows)
         for aid in sorted(current.keys() & prev.keys(), key=lambda x: int(x) if x.isdigit() else x):
-            if current[aid] != prev[aid]:
+            if not account_digests_equal(prev[aid], current[aid]):
                 row = dict(by_id[aid])
                 row["_previous"] = prev[aid]
                 changed.append(row)
@@ -816,7 +836,31 @@ def account_digest(row: dict[str, Any]) -> dict[str, Any]:
         "expired": bool(row.get("expired")),
         "expires_at": row.get("expires_at"),
         "error_message_hash": stable_hash(str(row.get("error_message") or "")) if row.get("error_message") else "",
+        "groups": account_groups_digest(row),
     }
+
+
+def account_digests_equal(previous: dict[str, Any], current: dict[str, Any]) -> bool:
+    # Backward-compatible state migration: monitors upgraded from versions before
+    # account groups were tracked should not emit a one-time "all accounts changed"
+    # alert just because the persisted digest lacks the new groups key.
+    prev = dict(previous or {})
+    if "groups" not in prev and "groups" in current:
+        prev["groups"] = current.get("groups")
+    return prev == current
+
+
+def account_groups_digest(row: dict[str, Any]) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    for group in normalized_account_groups(row):
+        groups.append(
+            {
+                "id": group.get("id"),
+                "name": truncate(str(group.get("name") or ""), 80),
+                "status": truncate(str(group.get("status") or ""), 40),
+            }
+        )
+    return groups
 
 
 def user_recharge_digest(row: dict[str, Any]) -> dict[str, Any]:
@@ -895,11 +939,15 @@ def build_account_message(
             shown += 1
         for old in removed[: cfg.detail_limit]:
             previous_state = describe_account_state(old, include_error=False)
-            lines.append(
+            removed_lines = [
                 f"➖ {h('移除')} {tg_code('#' + str(old.get('id')))} "
                 f"{tg_code(str(old.get('platform') or 'unknown') + '/' + str(old.get('plan') or 'unknown'))}"
                 f"\n  {h('移除前：')} {h(previous_state)}"
-            )
+            ]
+            groups = account_groups_summary(old)
+            if groups:
+                removed_lines.append(f"  {h('所属分组：' + groups)}")
+            lines.append("\n".join(removed_lines))
             shown += 1
         total_changes = len(changed) + len(added) + len(removed)
         if total_changes > shown:
@@ -1021,7 +1069,11 @@ def format_account_row(row: dict[str, Any], cfg: Config, prefix: str = "") -> st
     second_bits = [detail]
     if quota:
         second_bits.append(quota)
-    return " ".join(head_bits) + "\n  " + h(" · ").join(second_bits)
+    lines = [" ".join(head_bits), "  " + h(" · ").join(second_bits)]
+    groups = account_groups_summary(row)
+    if groups:
+        lines.append(f"  {h('所属分组：' + groups)}")
+    return "\n".join(lines)
 
 
 
@@ -1039,7 +1091,7 @@ def format_account_change_row(row: dict[str, Any], cfg: Config) -> str:
     details: list[str] = []
     old_label = f"{previous.get('platform') or 'unknown'}/{previous.get('plan') or 'unknown'}"
     if old_label != label:
-        details.append(f"分组：{old_label} → {label}")
+        details.append(f"平台/套餐：{old_label} → {label}")
     old_type = str(previous.get("type") or "")
     new_type = str(row.get("type") or "")
     if old_type and new_type and old_type != new_type:
@@ -1057,6 +1109,14 @@ def format_account_change_row(row: dict[str, Any], cfg: Config) -> str:
     quota = plain_account_quota_summary(row)
     if quota:
         details.append(f"当前用量：{quota}")
+
+    old_groups = account_groups_summary(previous)
+    new_groups = account_groups_summary(row)
+    if old_groups or new_groups:
+        if old_groups and old_groups != new_groups:
+            details.append(f"所属分组：{old_groups} → {new_groups or '未分组'}")
+        else:
+            details.append(f"所属分组：{new_groups or old_groups}")
 
     return " ".join(head_bits) + "\n  " + "\n  ".join(h(detail) for detail in details)
 
@@ -1107,6 +1167,65 @@ def plain_account_quota_summary(row: dict[str, Any]) -> str:
 
 def account_quota_summary(row: dict[str, Any]) -> str:
     return h(plain_account_quota_summary(row))
+
+
+def normalized_account_groups(row: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = row.get("groups")
+    if raw in (None, ""):
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return [{"id": None, "name": raw, "status": ""}] if raw.strip() else []
+    if not isinstance(raw, list):
+        return []
+
+    groups: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            groups.append(item)
+        elif item not in (None, ""):
+            groups.append({"id": None, "name": str(item), "status": ""})
+    return groups
+
+
+def account_groups_summary(row: dict[str, Any], max_groups: int = 5, max_chars: int = 96) -> str:
+    groups = normalized_account_groups(row)
+    if not groups:
+        return ""
+
+    labels: list[str] = []
+    used = 0
+    for group in groups:
+        label = account_group_label(group)
+        if not label:
+            continue
+        next_used = used + len(label) + (1 if labels else 0)
+        if labels and (len(labels) >= max_groups or next_used > max_chars):
+            break
+        labels.append(label)
+        used = next_used
+
+    if not labels:
+        return ""
+    hidden = max(0, len(groups) - len(labels))
+    summary = "、".join(labels)
+    if hidden:
+        summary += f" 等 {len(groups)} 个"
+    return summary
+
+
+def account_group_label(group: dict[str, Any]) -> str:
+    name = truncate(str(group.get("name") or "").strip(), 28)
+    group_id = group.get("id")
+    label = name or (f"#{group_id}" if group_id not in (None, "") else "")
+    if not label:
+        return ""
+    status = str(group.get("status") or "").strip()
+    if status and status != "active":
+        label += f"({truncate(status, 16)})"
+    return label
 
 
 def clean_account_error(message: str) -> str:

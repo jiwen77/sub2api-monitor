@@ -365,6 +365,11 @@ class PredicateTests(unittest.TestCase):
             "temp_unschedulable": False,
             "expired": False,
             "email": "normal@example.com",
+            "groups": [
+                {"id": 1, "name": "default", "status": "active"},
+                {"id": 2, "name": "claude-code", "status": "active"},
+                {"id": 3, "name": "vip", "status": "disabled"},
+            ],
         }
         abnormal = {
             "id": 101,
@@ -393,8 +398,52 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("全部账号状态（2 个）", message)
         self.assertIn("#108", message)
         self.assertIn("#101", message)
+        self.assertIn("所属分组：default、claude-code、vip(disabled)", message)
         self.assertIn("正常", message)
         self.assertNotIn("当前需要关注", message)
+
+    def test_account_group_summary_limits_many_groups_cleanly(self):
+        row = {
+            "groups": [
+                {"id": idx, "name": f"group-{idx}", "status": "active"}
+                for idx in range(1, 8)
+            ]
+        }
+
+        self.assertEqual(
+            m.account_groups_summary(row, max_groups=3),
+            "group-1、group-2、group-3 等 7 个",
+        )
+
+    def test_group_membership_digest_migration_does_not_alert_all_accounts_once(self):
+        previous = {
+            "id": 108,
+            "platform": "openai",
+            "type": "oauth",
+            "plan": "plus",
+            "status": "active",
+            "normal": True,
+            "schedulable": True,
+            "rate_limited": False,
+            "rate_limit_reset_at": None,
+            "overloaded": False,
+            "overload_until": None,
+            "temp_unschedulable": False,
+            "temp_unschedulable_until": None,
+            "temp_unschedulable_reason": "",
+            "expired": False,
+            "expires_at": None,
+            "error_message_hash": "",
+        }
+        current = dict(previous)
+        current["groups"] = [{"id": 1, "name": "default", "status": "active"}]
+
+        self.assertTrue(m.account_digests_equal(previous, current))
+
+        previous_after_migration = dict(current)
+        changed = dict(current)
+        changed["groups"] = [{"id": 2, "name": "vip", "status": "active"}]
+        self.assertFalse(m.account_digests_equal(previous_after_migration, changed))
 
 
 if __name__ == "__main__":

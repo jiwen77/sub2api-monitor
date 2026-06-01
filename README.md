@@ -12,7 +12,7 @@ _A passive Sub2API monitoring daemon that sends privacy-aware Telegram alerts._
 
 | Capability | What it does |
 | --- | --- |
-| Account alerts | Detects account additions, removals, and health changes such as error, rate limit, overload, temporary unschedulable, and expiry states |
+| Account alerts | Detects account additions, removals, group changes, and health changes such as error, rate limit, overload, temporary unschedulable, and expiry states |
 | Recharge alerts | Detects increases in `users.total_recharged` and reports the recharge delta, cumulative recharge, and current balance |
 | Upstream error alerts | Reads `ops_error_logs` and reports actionable provider-side `429` and `5xx` failures |
 | Exit-network alerts | Separately reports proxy, DNS, timeout, TLS, and connection failures without exposing proxy credentials |
@@ -156,7 +156,7 @@ Use menu option `13) 交互式修改配置项` for guided edits, or option `14) 
 
 | Category | Source table | Trigger |
 | --- | --- | --- |
-| Account status | `accounts` | Account state changes from the previous baseline |
+| Account status | `accounts`, `account_groups`, `groups` | Account state or group-membership changes from the previous baseline |
 | User recharge | `users` | `total_recharged` increases after the first baseline |
 | Upstream error | `ops_error_logs` | Provider-side actionable status codes, usually `429` or `5xx` |
 | Exit-network error | `ops_error_logs` | Proxy, DNS, timeout, TLS, connection reset/refused, or similar failures |
@@ -168,8 +168,8 @@ Commands are accepted only from authorized chat IDs.
 
 | Command | Description |
 | --- | --- |
-| `/status` | Send account overview and current non-normal account details |
-| `/accounts` | Send every account's current status |
+| `/status` | Send account overview and current non-normal account details, including group labels |
+| `/accounts` | Send every account's current status, including group labels |
 | `/daily` | Send the previous-day/current-day usage report |
 | `/ping` | Check whether the daemon is receiving commands |
 | `/help` | Show command help |
