@@ -38,8 +38,9 @@ except Exception:  # pragma: no cover
 APP_NAME = "sub2api-monitor"
 
 TELEGRAM_BOT_COMMANDS = [
-    {"command": "status", "description": "账号总览"},
-    {"command": "accounts", "description": "所有账号状态"},
+    {"command": "status", "description": "健康概览"},
+    {"command": "accounts", "description": "账号清单"},
+    {"command": "groups", "description": "分组概览"},
     {"command": "daily", "description": "昨日/今日用量日报"},
     {"command": "ping", "description": "检查 bot 是否在线"},
     {"command": "help", "description": "显示帮助"},
@@ -365,23 +366,13 @@ class Monitor:
                 self.send(build_command_help(), chat_id=chat_id)
             elif command in {"/status", "/account", "/summary"}:
                 rows = self.current_account_rows()
-                self.send(build_account_message(rows, [], [], [], self.cfg, title="ℹ️ sub2api 当前账号状态"), chat_id=chat_id)
+                self.send(build_account_message(rows, [], [], [], self.cfg, title="🩺 sub2api 健康概览"), chat_id=chat_id)
             elif command in {"/accounts", "/status_all", "/all_status", "/allstatus", "/accounts_all", "/allaccounts"}:
                 rows = self.current_account_rows()
-                self.send(
-                    build_account_message(
-                        rows,
-                        [],
-                        [],
-                        [],
-                        self.cfg,
-                        title="ℹ️ sub2api 全部账号状态",
-                        include_abnormal=False,
-                        include_all=True,
-                        clamp=False,
-                    ),
-                    chat_id=chat_id,
-                )
+                self.send(build_accounts_list_message(rows, self.cfg), chat_id=chat_id)
+            elif command in {"/groups", "/group"}:
+                rows = self.current_account_rows()
+                self.send(build_groups_message(rows, self.cfg), chat_id=chat_id)
             elif command in {"/daily", "/report"}:
                 tz = self.cfg.tzinfo()
                 day = dt.datetime.now(tz).date() - dt.timedelta(days=1)
@@ -972,6 +963,57 @@ def build_account_message(
     return clamp_message(text) if clamp else text
 
 
+def build_accounts_list_message(rows: list[dict[str, Any]], cfg: Config) -> str:
+    lines = [
+        "📋 <b>sub2api 账号清单</b>",
+        muted(now_iso(cfg.tzinfo())),
+        "",
+        section(f"账号清单（{len(rows)} 个）"),
+    ]
+    if rows:
+        for row in rows:
+            lines.append(format_account_row(row, cfg))
+    else:
+        lines.append(muted("暂无账号"))
+    return "\n".join(lines)
+
+
+def build_groups_message(rows: list[dict[str, Any]], cfg: Config) -> str:
+    buckets = summarize_account_groups(rows)
+    lines = [
+        "🧩 <b>sub2api 分组概览</b>",
+        muted(now_iso(cfg.tzinfo())),
+        "",
+        section(f"分组健康（{len(buckets)} 个）"),
+    ]
+    if buckets:
+        for bucket in buckets[: cfg.detail_limit]:
+            lines.append(format_group_summary_line(bucket))
+        if len(buckets) > cfg.detail_limit:
+            lines.append(muted(f"另有 {len(buckets) - cfg.detail_limit} 个分组未展开"))
+    else:
+        lines.append(muted("暂无分组"))
+
+    attention_buckets = [bucket for bucket in buckets if bucket.get("abnormal_rows")]
+    if attention_buckets:
+        lines += ["", section("需要关注的分组账号")]
+        shown_groups = 0
+        max_rows_per_group = 3
+        for bucket in attention_buckets[: cfg.detail_limit]:
+            rows_to_show = sorted(bucket.get("abnormal_rows") or [], key=account_sort_key)
+            lines.append(f"• {tg_code(group_bucket_label(bucket))}")
+            for row in rows_to_show[:max_rows_per_group]:
+                lines.append(f"  {format_account_inline_row(row, cfg)}")
+            if len(rows_to_show) > max_rows_per_group:
+                lines.append(muted(f"  另有 {len(rows_to_show) - max_rows_per_group} 个账号未展开"))
+            shown_groups += 1
+        if len(attention_buckets) > shown_groups:
+            lines.append(muted(f"另有 {len(attention_buckets) - shown_groups} 个异常分组未展开"))
+    else:
+        lines += ["", muted("当前没有非正常分组账号")]
+    return clamp_message("\n".join(lines))
+
+
 def build_user_recharge_message(rows: list[dict[str, Any]], cfg: Config) -> str:
     total_delta = sum((decimal_value(row.get("_recharge_delta")) for row in rows), Decimal("0"))
     lines = [
@@ -1043,6 +1085,85 @@ def format_summary_line(key: tuple[str, str], bucket: dict[str, int], html_mode:
     return f"{icon} {label} {normal}/{total}" + (f" · {' · '.join(extras)}" if extras else "")
 
 
+def summarize_account_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        groups = normalized_account_groups(row)
+        if not groups:
+            groups = [{"id": "__ungrouped__", "name": "未分组", "status": ""}]
+        for group in groups:
+            key = account_group_key(group)
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "group": group,
+                    "normal": 0,
+                    "total": 0,
+                    "rate_limited": 0,
+                    "error": 0,
+                    "overloaded": 0,
+                    "temp": 0,
+                    "expired": 0,
+                    "rows": [],
+                    "abnormal_rows": [],
+                },
+            )
+            bucket["total"] += 1
+            bucket["rows"].append(row)
+            if row.get("normal"):
+                bucket["normal"] += 1
+            else:
+                bucket["abnormal_rows"].append(row)
+            if row.get("rate_limited"):
+                bucket["rate_limited"] += 1
+            if row.get("status") not in ("active", ""):
+                bucket["error"] += 1
+            if row.get("overloaded"):
+                bucket["overloaded"] += 1
+            if row.get("temp_unschedulable"):
+                bucket["temp"] += 1
+            if row.get("expired"):
+                bucket["expired"] += 1
+    return sorted(buckets.values(), key=group_bucket_sort_key)
+
+
+def account_group_key(group: dict[str, Any]) -> str:
+    group_id = group.get("id")
+    if group_id not in (None, ""):
+        return "id:" + str(group_id)
+    return "name:" + str(group.get("name") or "")
+
+
+def group_bucket_sort_key(bucket: dict[str, Any]) -> tuple[int, str]:
+    total = int(bucket.get("total") or 0)
+    normal = int(bucket.get("normal") or 0)
+    severity = 0 if total and normal < total else 1
+    return severity, group_bucket_label(bucket).lower()
+
+
+def format_group_summary_line(bucket: dict[str, Any]) -> str:
+    total = max(int(bucket.get("total") or 0), 0)
+    normal = max(int(bucket.get("normal") or 0), 0)
+    extras = []
+    if bucket.get("rate_limited"):
+        extras.append(f"限流{bucket['rate_limited']}")
+    if bucket.get("error"):
+        extras.append(f"异常{bucket['error']}")
+    if bucket.get("overloaded"):
+        extras.append(f"过载{bucket['overloaded']}")
+    if bucket.get("temp"):
+        extras.append(f"临停{bucket['temp']}")
+    if bucket.get("expired"):
+        extras.append(f"过期{bucket['expired']}")
+    icon = summary_icon(normal, total, extras)
+    line = f"{icon} {tg_code(group_bucket_label(bucket))} {normal}/{total}"
+    return line + (f" · {h(' · '.join(extras))}" if extras else "")
+
+
+def group_bucket_label(bucket: dict[str, Any]) -> str:
+    return account_group_label(bucket.get("group") or {}) or "未分组"
+
+
 def summary_icon(normal: int, total: int, extras: list[str]) -> str:
     if total <= 0 or normal == 0:
         return "🔴"
@@ -1074,6 +1195,23 @@ def format_account_row(row: dict[str, Any], cfg: Config, prefix: str = "") -> st
     if groups:
         lines.append(f"  {h('所属分组：' + groups)}")
     return "\n".join(lines)
+
+
+def format_account_inline_row(row: dict[str, Any], cfg: Config) -> str:
+    icon = account_icon(row)
+    label = f"{row.get('platform') or 'unknown'}/{row.get('plan') or 'unknown'}"
+    ident = tg_code(f"#{row.get('id')}")
+    name = display_identifier(row, cfg)
+    head_bits = [icon, ident]
+    if name:
+        head_bits.append(h(name))
+    head_bits.append(tg_code(label))
+
+    detail = describe_account_state(row, include_error=True)
+    quota = plain_account_quota_summary(row)
+    if quota:
+        detail += f" · {quota}"
+    return " ".join(head_bits) + f" — {h(detail)}"
 
 
 

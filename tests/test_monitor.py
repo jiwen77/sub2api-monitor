@@ -445,6 +445,72 @@ class PredicateTests(unittest.TestCase):
         changed["groups"] = [{"id": 2, "name": "vip", "status": "active"}]
         self.assertFalse(m.account_digests_equal(previous_after_migration, changed))
 
+    def test_accounts_list_message_is_not_health_overview(self):
+        cfg = m.Config()
+        message = m.build_accounts_list_message(
+            [
+                {
+                    "id": 108,
+                    "platform": "openai",
+                    "plan": "plus",
+                    "status": "active",
+                    "normal": True,
+                    "schedulable": True,
+                    "rate_limited": False,
+                    "overloaded": False,
+                    "temp_unschedulable": False,
+                    "expired": False,
+                    "groups": [{"id": 1, "name": "default", "status": "active"}],
+                }
+            ],
+            cfg,
+        )
+
+        self.assertIn("账号清单（1 个）", message)
+        self.assertIn("所属分组：default", message)
+        self.assertNotIn("账号概览", message)
+        self.assertNotIn("当前需要关注", message)
+
+    def test_groups_message_summarizes_memberships_and_attention_items(self):
+        cfg = m.Config()
+        rows = [
+            {
+                "id": 108,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "active",
+                "normal": True,
+                "schedulable": True,
+                "rate_limited": False,
+                "overloaded": False,
+                "temp_unschedulable": False,
+                "expired": False,
+                "groups": [{"id": 1, "name": "default", "status": "active"}],
+            },
+            {
+                "id": 101,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "error",
+                "normal": False,
+                "schedulable": True,
+                "rate_limited": False,
+                "error_message": "Token revoked (401)",
+                "groups": [
+                    {"id": 1, "name": "default", "status": "active"},
+                    {"id": 2, "name": "vip", "status": "active"},
+                ],
+            },
+        ]
+
+        message = m.build_groups_message(rows, cfg)
+
+        self.assertIn("分组概览", message)
+        self.assertIn("<code>default</code> 1/2", message)
+        self.assertIn("<code>vip</code> 0/1", message)
+        self.assertIn("需要关注的分组账号", message)
+        self.assertIn("#101", message)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -466,7 +532,7 @@ class TelegramCommandTests(unittest.TestCase):
         self.assertTrue(m.telegram_chat_allowed(cfg, '456'))
         self.assertTrue(m.telegram_chat_allowed(cfg, '789'))
 
-    def test_accounts_command_sends_all_accounts(self):
+    def test_accounts_command_sends_account_list(self):
         class FakeMonitor(m.Monitor):
             def __init__(self, cfg):
                 self.sent = []
@@ -509,6 +575,41 @@ class TelegramCommandTests(unittest.TestCase):
         self.assertEqual(len(mon.sent), 1)
         text, chat_id = mon.sent[0]
         self.assertEqual(chat_id, "123")
-        self.assertIn("全部账号状态（2 个）", text)
+        self.assertIn("账号清单（2 个）", text)
         self.assertIn("#108", text)
+        self.assertIn("#101", text)
+        self.assertNotIn("账号概览", text)
+
+    def test_groups_command_sends_group_overview(self):
+        class FakeMonitor(m.Monitor):
+            def __init__(self, cfg):
+                self.sent = []
+                super().__init__(cfg, dry_run=True)
+
+            def current_account_rows(self):
+                return [
+                    {
+                        "id": 101,
+                        "platform": "openai",
+                        "plan": "plus",
+                        "status": "error",
+                        "normal": False,
+                        "schedulable": True,
+                        "rate_limited": False,
+                        "groups": [{"id": 1, "name": "default", "status": "active"}],
+                    }
+                ]
+
+            def send(self, text, chat_id=None):
+                self.sent.append((text, chat_id))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mon = FakeMonitor(m.Config(state_file=f"{tmp}/state.json", telegram_chat_id="123"))
+            mon.handle_telegram_update({"message": {"chat": {"id": "123"}, "text": "/groups"}})
+
+        self.assertEqual(len(mon.sent), 1)
+        text, chat_id = mon.sent[0]
+        self.assertEqual(chat_id, "123")
+        self.assertIn("分组概览", text)
+        self.assertIn("default", text)
         self.assertIn("#101", text)
