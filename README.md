@@ -17,7 +17,7 @@ _A passive Sub2API monitoring daemon that sends privacy-aware Telegram alerts._
 | Upstream error alerts | Reads `ops_error_logs` and reports actionable provider-side `429` and `5xx` failures |
 | Exit-network alerts | Separately reports proxy, DNS, timeout, TLS, and connection failures without exposing proxy credentials |
 | Daily usage reports | Summarizes request count, token usage, cost, account-plan breakdowns, and top models |
-| Telegram commands | Supports `/status`, `/daily`, `/ping`, `/help`, and `/accounts` while the daemon is running |
+| Telegram commands | Supports `/status`, `/accounts`, `/daily`, `/ping`, and `/help` while the daemon is running |
 | Interactive installer | Provides a menu-driven shell script for install, update, configuration, service management, and smoke tests |
 
 ## 🔒 Privacy and security
@@ -168,8 +168,8 @@ Commands are accepted only from authorized chat IDs.
 
 | Command | Description |
 | --- | --- |
-| `/status` | Send the current account status immediately |
-| `/accounts` | Alias for `/status` |
+| `/status` | Send account overview and current non-normal account details |
+| `/accounts` | Send every account's current status |
 | `/daily` | Send the previous-day/current-day usage report |
 | `/ping` | Check whether the daemon is receiving commands |
 | `/help` | Show command help |

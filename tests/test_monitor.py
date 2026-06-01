@@ -350,6 +350,52 @@ class PredicateTests(unittest.TestCase):
         self.assertNotIn("当前需要关注", message)
         self.assertNotIn("#101", message)
 
+    def test_account_message_can_include_all_accounts(self):
+        cfg = m.Config()
+        normal = {
+            "id": 108,
+            "platform": "openai",
+            "type": "oauth",
+            "plan": "plus",
+            "status": "active",
+            "normal": True,
+            "schedulable": True,
+            "rate_limited": False,
+            "overloaded": False,
+            "temp_unschedulable": False,
+            "expired": False,
+            "email": "normal@example.com",
+        }
+        abnormal = {
+            "id": 101,
+            "platform": "openai",
+            "type": "oauth",
+            "plan": "plus",
+            "status": "error",
+            "normal": False,
+            "schedulable": True,
+            "rate_limited": False,
+            "error_message": "Token revoked (401)",
+        }
+
+        message = m.build_account_message(
+            [normal, abnormal],
+            [],
+            [],
+            [],
+            cfg,
+            title="test",
+            include_abnormal=False,
+            include_all=True,
+            clamp=False,
+        )
+
+        self.assertIn("全部账号状态（2 个）", message)
+        self.assertIn("#108", message)
+        self.assertIn("#101", message)
+        self.assertIn("正常", message)
+        self.assertNotIn("当前需要关注", message)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -357,6 +403,7 @@ if __name__ == "__main__":
 class TelegramCommandTests(unittest.TestCase):
     def test_normalize_telegram_command(self):
         self.assertEqual(m.normalize_telegram_command('/status@SomeBot now'), '/status')
+        self.assertEqual(m.normalize_telegram_command('/STATUS_ALL@SomeBot now'), '/status_all')
         self.assertEqual(m.normalize_telegram_command('/DAILY'), '/daily')
 
     def test_chat_authorization_defaults_to_notification_chat(self):
@@ -369,3 +416,50 @@ class TelegramCommandTests(unittest.TestCase):
         self.assertFalse(m.telegram_chat_allowed(cfg, '123'))
         self.assertTrue(m.telegram_chat_allowed(cfg, '456'))
         self.assertTrue(m.telegram_chat_allowed(cfg, '789'))
+
+    def test_accounts_command_sends_all_accounts(self):
+        class FakeMonitor(m.Monitor):
+            def __init__(self, cfg):
+                self.sent = []
+                super().__init__(cfg, dry_run=True)
+
+            def current_account_rows(self):
+                return [
+                    {
+                        "id": 108,
+                        "platform": "openai",
+                        "type": "oauth",
+                        "plan": "plus",
+                        "status": "active",
+                        "normal": True,
+                        "schedulable": True,
+                        "rate_limited": False,
+                        "overloaded": False,
+                        "temp_unschedulable": False,
+                        "expired": False,
+                    },
+                    {
+                        "id": 101,
+                        "platform": "openai",
+                        "type": "oauth",
+                        "plan": "plus",
+                        "status": "error",
+                        "normal": False,
+                        "schedulable": True,
+                        "rate_limited": False,
+                    },
+                ]
+
+            def send(self, text, chat_id=None):
+                self.sent.append((text, chat_id))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mon = FakeMonitor(m.Config(state_file=f"{tmp}/state.json", telegram_chat_id="123"))
+            mon.handle_telegram_update({"message": {"chat": {"id": "123"}, "text": "/accounts"}})
+
+        self.assertEqual(len(mon.sent), 1)
+        text, chat_id = mon.sent[0]
+        self.assertEqual(chat_id, "123")
+        self.assertIn("全部账号状态（2 个）", text)
+        self.assertIn("#108", text)
+        self.assertIn("#101", text)

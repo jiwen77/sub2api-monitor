@@ -38,7 +38,8 @@ except Exception:  # pragma: no cover
 APP_NAME = "sub2api-monitor"
 
 TELEGRAM_BOT_COMMANDS = [
-    {"command": "status", "description": "当前账号状态"},
+    {"command": "status", "description": "账号总览"},
+    {"command": "accounts", "description": "所有账号状态"},
     {"command": "daily", "description": "昨日/今日用量日报"},
     {"command": "ping", "description": "检查 bot 是否在线"},
     {"command": "help", "description": "显示帮助"},
@@ -362,9 +363,25 @@ class Monitor:
         try:
             if command in {"/start", "/help"}:
                 self.send(build_command_help(), chat_id=chat_id)
-            elif command in {"/status", "/accounts", "/account", "/summary"}:
+            elif command in {"/status", "/account", "/summary"}:
                 rows = self.current_account_rows()
                 self.send(build_account_message(rows, [], [], [], self.cfg, title="ℹ️ sub2api 当前账号状态"), chat_id=chat_id)
+            elif command in {"/accounts", "/status_all", "/all_status", "/allstatus", "/accounts_all", "/allaccounts"}:
+                rows = self.current_account_rows()
+                self.send(
+                    build_account_message(
+                        rows,
+                        [],
+                        [],
+                        [],
+                        self.cfg,
+                        title="ℹ️ sub2api 全部账号状态",
+                        include_abnormal=False,
+                        include_all=True,
+                        clamp=False,
+                    ),
+                    chat_id=chat_id,
+                )
             elif command in {"/daily", "/report"}:
                 tz = self.cfg.tzinfo()
                 day = dt.datetime.now(tz).date() - dt.timedelta(days=1)
@@ -849,6 +866,8 @@ def build_account_message(
     title: str,
     include_summary: bool = True,
     include_abnormal: bool = True,
+    include_all: bool = False,
+    clamp: bool = True,
 ) -> str:
     _summary_lines, buckets = summarize_accounts(rows)
     lines = [
@@ -892,7 +911,17 @@ def build_account_message(
             lines.append(format_account_row(row, cfg))
         if len(abnormal) > cfg.detail_limit:
             lines.append(muted(f"另有 {len(abnormal) - cfg.detail_limit} 个非正常账号未展开"))
-    return clamp_message("\n".join(lines))
+
+    if include_all:
+        lines += ["", section(f"全部账号状态（{len(rows)} 个）")]
+        if rows:
+            for row in rows:
+                lines.append(format_account_row(row, cfg))
+        else:
+            lines.append(muted("暂无账号"))
+
+    text = "\n".join(lines)
+    return clamp_message(text) if clamp else text
 
 
 def build_user_recharge_message(rows: list[dict[str, Any]], cfg: Config) -> str:
