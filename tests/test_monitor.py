@@ -508,8 +508,9 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("分组概览", message)
         self.assertIn("<code>default</code> 1/2", message)
         self.assertIn("<code>vip</code> 0/1", message)
-        self.assertIn("需要关注的分组账号", message)
-        self.assertIn("#101", message)
+        self.assertIn("需要关注的账号（去重，1 个）", message)
+        self.assertEqual(message.count("#101"), 1)
+        self.assertIn("所属分组：default、vip", message)
 
 
 if __name__ == "__main__":

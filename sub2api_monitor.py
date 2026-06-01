@@ -994,21 +994,13 @@ def build_groups_message(rows: list[dict[str, Any]], cfg: Config) -> str:
     else:
         lines.append(muted("暂无分组"))
 
-    attention_buckets = [bucket for bucket in buckets if bucket.get("abnormal_rows")]
-    if attention_buckets:
-        lines += ["", section("需要关注的分组账号")]
-        shown_groups = 0
-        max_rows_per_group = 3
-        for bucket in attention_buckets[: cfg.detail_limit]:
-            rows_to_show = sorted(bucket.get("abnormal_rows") or [], key=account_sort_key)
-            lines.append(f"• {tg_code(group_bucket_label(bucket))}")
-            for row in rows_to_show[:max_rows_per_group]:
-                lines.append(f"  {format_account_inline_row(row, cfg)}")
-            if len(rows_to_show) > max_rows_per_group:
-                lines.append(muted(f"  另有 {len(rows_to_show) - max_rows_per_group} 个账号未展开"))
-            shown_groups += 1
-        if len(attention_buckets) > shown_groups:
-            lines.append(muted(f"另有 {len(attention_buckets) - shown_groups} 个异常分组未展开"))
+    abnormal_rows = sorted([row for row in rows if not row.get("normal")], key=account_sort_key)
+    if abnormal_rows:
+        lines += ["", section(f"需要关注的账号（去重，{len(abnormal_rows)} 个）")]
+        for row in abnormal_rows[: cfg.detail_limit]:
+            lines.append(format_account_row(row, cfg))
+        if len(abnormal_rows) > cfg.detail_limit:
+            lines.append(muted(f"另有 {len(abnormal_rows) - cfg.detail_limit} 个非正常账号未展开"))
     else:
         lines += ["", muted("当前没有非正常分组账号")]
     return clamp_message("\n".join(lines))

@@ -170,7 +170,7 @@ Commands are accepted only from authorized chat IDs.
 | --- | --- |
 | `/status` | Send a health overview and current non-normal account details |
 | `/accounts` | Send the full account list with group labels |
-| `/groups` | Send a group-level health overview |
+| `/groups` | Send a group-level health overview, then de-duplicated non-normal accounts |
 | `/daily` | Send the previous-day/current-day usage report |
 | `/ping` | Check whether the daemon is receiving commands |
 | `/help` | Show command help |
