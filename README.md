@@ -1,67 +1,94 @@
 # sub2api-monitor
 
-A passive monitoring and Telegram alerting tool for [Sub2API](https://github.com/Wei-Shaw/sub2api).
+_A passive Sub2API monitoring daemon that sends privacy-aware Telegram alerts._
 
-`sub2api-monitor` does **not** send synthetic requests to upstream providers. It only reads Sub2API's own PostgreSQL tables and reports changes that Sub2API has already observed.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](#requirements)
+[![Sub2API](https://img.shields.io/badge/Sub2API-compatible-green.svg)](https://github.com/Wei-Shaw/sub2api)
 
-## Features
+`sub2api-monitor` watches an existing [Sub2API](https://github.com/Wei-Shaw/sub2api) PostgreSQL database and sends concise Telegram notifications. It is intentionally passive: it does not probe upstream providers, does not mutate Sub2API tables, and keeps operational secrets outside the Git repository.
 
-- **Account status alerts**
-  - Summarizes accounts by `platform/plan`, for example `openai/free: normal 2/2`.
-  - Can send the current account status on demand, even when nothing changed.
-  - Automatic change alerts only show the accounts that changed, so old abnormalities are not repeated every time.
-  - Reports state changes for active/error/rate-limited/overloaded/temporarily-unschedulable/expired accounts.
-  - Redacts account identifiers by default.
+## 🚀 Highlights
 
-- **User recharge alerts**
-  - Reads Sub2API `users.total_recharged`.
-  - Sends a Telegram notification when a user's cumulative recharge amount increases.
-  - Shows the recharge delta, current cumulative recharge, current balance, and a redacted user identifier.
+| Capability | What it does |
+| --- | --- |
+| Account alerts | Detects account additions, removals, and health changes such as error, rate limit, overload, temporary unschedulable, and expiry states |
+| Recharge alerts | Detects increases in `users.total_recharged` and reports the recharge delta, cumulative recharge, and current balance |
+| Upstream error alerts | Reads `ops_error_logs` and reports actionable provider-side `429` and `5xx` failures |
+| Exit-network alerts | Separately reports proxy, DNS, timeout, TLS, and connection failures without exposing proxy credentials |
+| Daily usage reports | Summarizes request count, token usage, cost, account-plan breakdowns, and top models |
+| Telegram commands | Supports `/status`, `/daily`, `/ping`, `/help`, and `/accounts` while the daemon is running |
+| Interactive installer | Provides a menu-driven shell script for install, update, configuration, service management, and smoke tests |
 
-- **Upstream and exit-network error alerts**
-  - Reads Sub2API `ops_error_logs`.
-  - Defaults to provider/upstream `429` and `5xx` alerts.
-  - Separately alerts likely exit-proxy/network failures such as proxy tunnel, DNS, timeout, TLS, connection reset/refused, including the proxy name when Sub2API has one configured.
-  - Filters out common client-side, API-key, authentication, and request-body errors.
+## 🔒 Privacy and security
 
-- **Readable Telegram cards**
-  - Uses compact lines, emoji severity hints, bold section headers, and shortened error summaries.
+The project is designed for public GitHub hosting and privacy-aware operations.
 
-- **Daily usage report**
-  - Reads Sub2API `usage_logs`.
-  - Sends previous-day totals and current-day-to-now totals.
-  - Includes request count, token totals, cost, account-plan breakdown, and top models.
+| Area | Behavior |
+| --- | --- |
+| Secrets | Real Telegram tokens, chat IDs, database passwords, and Sub2API `.env` values stay outside the repository |
+| User identifiers | Account and user names/emails are redacted by default with `REDACT_IDENTIFIERS=true` |
+| Proxy data | Proxy alert cards show safe labels such as name, ID, protocol, and status, but not host, username, or password |
+| Low-level IDs | Request IDs and raw ops-log IDs are omitted from default Telegram alert text |
+| Database access | The monitor only reads Sub2API tables through `psql`; it does not write application data |
+| Examples | README examples use placeholders or masked identifiers only |
 
-- **Telegram bot commands**
-  - While the daemon is running, send `/status` to receive the current account status immediately.
-  - Supports `/daily`, `/ping`, and `/help`.
-  - Registers Telegram slash-command suggestions with `setMyCommands` so typing `/` can show completions.
-  - Only authorized chat IDs are served.
+Example recharge alert with redaction enabled:
 
-- **Interactive management script**
-  - Configure Telegram.
-  - Test notifications.
-  - Print current account status.
-  - Install/update from GitHub.
-  - Install and manage the systemd service.
+```text
+💰 Sub2API 用户充值
+2026-06-01 13:45:20 CST
+新增 1 笔 / 合计 +50
 
-## Requirements
+充值明细
+• #42 us***@ex*** (user, active)
+  充值：+50 · 累计：150 · 余额：75
+  更新时间：06-01 13:45
+```
 
-- Linux host running Sub2API with PostgreSQL.
-- Docker CLI access to the Sub2API PostgreSQL container.
-- Python 3.11+ recommended.
-- `git` and `rsync` for GitHub self-update.
-- A Telegram bot token and chat ID for notifications.
+## 🧭 How it works
 
-Default assumptions can be changed in `/etc/sub2api-monitor/config.env`:
+```mermaid
+flowchart LR
+    accTitle: Passive monitoring flow
+    accDescr: sub2api-monitor reads Sub2API PostgreSQL tables, stores local baselines, and sends Telegram notifications without probing upstream APIs or modifying Sub2API data.
 
-- Sub2API directory: `/opt/sub2api`
-- PostgreSQL container: `sub2api-postgres`
-- Sub2API env file: `/opt/sub2api/.env`
+    sub2api["Sub2API database"] --> monitor["sub2api-monitor"]
+    state["Local state file"] <--> monitor
+    monitor --> telegram["Telegram alerts"]
 
-## Quick start
+    classDef source fill:#e0f2fe,stroke:#0284c7,color:#0f172a
+    classDef service fill:#fef3c7,stroke:#d97706,color:#0f172a
+    classDef output fill:#dcfce7,stroke:#16a34a,color:#0f172a
 
-Download the management script and use menu option 1 to install the full project from GitHub:
+    class sub2api,state source
+    class monitor service
+    class telegram output
+```
+
+The daemon stores small local baselines in `STATE_FILE` so it can detect changes between polling intervals. Existing recharge totals are baselined on first run, so enabling the feature does not replay historical recharges.
+
+## ✅ Requirements
+
+- Linux host running Sub2API with PostgreSQL
+- Docker CLI access to the Sub2API PostgreSQL container
+- Python 3.11 or newer
+- `git` and `rsync` for self-update support
+- Telegram bot token and destination chat/channel ID
+
+Default paths are conventional and configurable:
+
+| Setting | Default |
+| --- | --- |
+| Sub2API directory | `/opt/sub2api` |
+| Monitor install directory | `/opt/sub2api-monitor` |
+| Monitor config | `/etc/sub2api-monitor/config.env` |
+| Monitor state | `/var/lib/sub2api-monitor/state.json` |
+| PostgreSQL container | `sub2api-postgres` |
+
+## ⚡ Quick start
+
+Download the management script and start the interactive installer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jiwen77/sub2api-monitor/main/monitor.sh -o /tmp/sub2api-monitor.sh
@@ -70,20 +97,112 @@ sudo bash /tmp/sub2api-monitor.sh
 
 Recommended first-run flow:
 
-1. `安装/更新程序（从 GitHub 拉取）`
-2. `配置 Telegram 通知`
-3. `测试 Telegram 通知`
-4. `查看账号状态（只显示，不发 TG）`
-5. `发送账号状态到 TG（立即发送）`
-6. `后台启动/重启监控（推荐）`
+1. Choose `安装/更新程序（从 GitHub 拉取）`
+2. Choose `配置 Telegram 通知`
+3. Choose `测试 Telegram 通知`
+4. Choose `查看账号状态（只显示，不发 TG）`
+5. Choose `发送账号状态到 TG（立即发送）`
+6. Choose `后台启动/重启监控（推荐）`
 
-After installation, open the menu with:
+After installation, reopen the menu with:
 
 ```bash
 sudo /opt/sub2api-monitor/monitor.sh
 ```
 
-## Self-update
+## 🛠️ Configuration
+
+The runtime config lives outside Git:
+
+```text
+/etc/sub2api-monitor/config.env
+```
+
+Start from [`config.env.example`](./config.env.example), then fill in local values on the server.
+
+```env
+TELEGRAM_BOT_TOKEN=<telegram-bot-token>
+TELEGRAM_CHAT_ID=<telegram-chat-or-channel-id>
+REDACT_IDENTIFIERS=true
+USER_RECHARGE_ALERTS_ENABLED=true
+POLL_INTERVAL_SECONDS=60
+```
+
+Important options:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `SUB2API_DIR` | `/opt/sub2api` | Sub2API deployment directory. The monitor reads this directory's `.env` for PostgreSQL credentials when present |
+| `POSTGRES_CONTAINER` | `sub2api-postgres` | PostgreSQL container name |
+| `TELEGRAM_BOT_TOKEN` | empty | Telegram bot token; never commit a real value |
+| `TELEGRAM_CHAT_ID` | empty | Telegram chat, group, channel, or user ID; never commit a real value |
+| `TELEGRAM_ALLOWED_CHAT_IDS` | empty | Optional comma-separated allowlist for bot commands; defaults to `TELEGRAM_CHAT_ID` |
+| `POLL_INTERVAL_SECONDS` | `60` | Daemon polling interval. Recharges detected within one interval are grouped into one notification |
+| `REDACT_IDENTIFIERS` | `true` | Redact account and user names/emails in Telegram messages |
+| `DETAIL_LIMIT` | `12` | Maximum rows expanded in one Telegram card |
+| `USER_RECHARGE_ALERTS_ENABLED` | `true` | Send Telegram notifications when `users.total_recharged` increases |
+| `ERROR_LOOKBACK_MINUTES` | `30` | Lookback window for new upstream errors |
+| `ERROR_COOLDOWN_SECONDS` | `600` | Per-error-group cooldown to reduce repeated alerts |
+| `UPSTREAM_ALLOWED_STATUS_CODES` | `429,500-599` | Provider/upstream HTTP statuses that should alert |
+| `PROXY_ERROR_ALERTS_ENABLED` | `true` | Separately alert likely exit-proxy and network failures |
+| `DAILY_REPORT_HOUR` | `0` | Local hour for daily report |
+| `DAILY_REPORT_MINUTE` | `0` | Local minute for daily report |
+
+Use menu option `13) 交互式修改配置项` for guided edits, or option `14) 手动编辑配置文件（nano）` for manual edits.
+
+## 📣 Alerts and commands
+
+### Alert categories
+
+| Category | Source table | Trigger |
+| --- | --- | --- |
+| Account status | `accounts` | Account state changes from the previous baseline |
+| User recharge | `users` | `total_recharged` increases after the first baseline |
+| Upstream error | `ops_error_logs` | Provider-side actionable status codes, usually `429` or `5xx` |
+| Exit-network error | `ops_error_logs` | Proxy, DNS, timeout, TLS, connection reset/refused, or similar failures |
+| Daily usage | `usage_logs` | Scheduled local-time daily summary |
+
+### Telegram commands
+
+Commands are accepted only from authorized chat IDs.
+
+| Command | Description |
+| --- | --- |
+| `/status` | Send the current account status immediately |
+| `/accounts` | Alias for `/status` |
+| `/daily` | Send the previous-day/current-day usage report |
+| `/ping` | Check whether the daemon is receiving commands |
+| `/help` | Show command help |
+
+To authorize more than one chat, use placeholders like this:
+
+```env
+TELEGRAM_ALLOWED_CHAT_IDS=<chat-id-1>,<chat-id-2>
+```
+
+## 🧪 Manual commands
+
+```bash
+# Print the current account snapshot without sending Telegram.
+python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env account-summary
+
+# Force-send the current account snapshot to Telegram.
+python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env account-summary --notify
+
+# Run account, recharge, and upstream-error checks once.
+python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env run-once --notify
+
+# Force-send the daily usage report.
+python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env daily --notify
+
+# Register Telegram slash-command suggestions.
+python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env setup-telegram-commands
+
+# Keep monitoring in the foreground.
+python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env daemon
+```
+
+## 🔁 Update and service management
 
 Interactive update:
 
@@ -98,95 +217,7 @@ Non-interactive update:
 sudo /opt/sub2api-monitor/monitor.sh --update
 ```
 
-By default, menu option 1 uses:
-
-```env
-UPDATE_REPO_URL=https://github.com/jiwen77/sub2api-monitor.git
-UPDATE_REF=main
-```
-
-For forks or pinned releases:
-
-```bash
-sudo UPDATE_REPO_URL=https://github.com/yourname/sub2api-monitor.git \
-  UPDATE_REF=main \
-  /opt/sub2api-monitor/monitor.sh --update
-```
-
-
-
-## Menu option guide
-
-Most users start with options 1-5 and 10; use option 13 when you want guided configuration changes:
-
-| Option | Use it for | Notes |
-| --- | --- | --- |
-| 1 | Install or update from GitHub | Pulls the latest project files, keeps your existing config, then reloads the new menu. |
-| 2 | Configure Telegram notifications | Saves bot token/chat ID in `/etc/sub2api-monitor/config.env`. |
-| 3 | Test Telegram notifications | Verifies the bot can send messages. |
-| 4 | View account status locally | Prints status only; does not send Telegram. |
-| 5 | Send account status to Telegram now | Always sends the current snapshot. |
-| 6 | Run alert checks once | Sends Telegram only if account state changed, a user recharge is found, or upstream errors are found. |
-| 7 | Preview daily report locally | Prints the report only. |
-| 8 | Send daily report to Telegram now | Always sends the current daily report. |
-| 9 | Run monitor temporarily in the foreground | Mainly for debugging; closing SSH stops it. |
-| 10 | Start/restart background monitoring | Recommended production mode; keeps running after SSH disconnects and after reboot. |
-| 11 | View background monitor status/logs | Useful when checking whether it is running normally. |
-| 12 | Stop background monitoring and disable autostart | Use this when you do not want automatic alerts anymore. |
-| 13 | Change common settings interactively | Guided prompts for polling, Telegram commands, alerts, daily reports, and Sub2API/Postgres paths. |
-| 14 | Manually edit config file | Opens `/etc/sub2api-monitor/config.env` in `nano` or `$EDITOR`. |
-| 15 | Uninstall program files | Keeps config/state by default. |
-
-
-## Error alert categories
-
-`Sub2API 上游错误` means the provider/upstream appears to have returned an actionable `429` or `5xx` response. Network-looking errors are excluded from this category. Alerts use a short human-readable format with account id/name/plan/status, proxy label, and a brief reason when available.
-
-`Sub2API 出口/网络错误` means the request appears to have failed before reaching the provider successfully, for example proxy tunnel failures, DNS errors, timeout, TLS/certificate errors, or connection reset/refused. This category is useful when an account's configured exit proxy is down. The alert includes proxy name/id/protocol/status and a brief reason when available, but does not include proxy host, username, password, request IDs, or raw log IDs by default.
-
-## Telegram commands
-
-When the systemd service or `daemon` command is running, the bot can also receive commands from Telegram. The monitor registers the command list with Telegram automatically on startup and when you run `测试 Telegram 通知`, so typing `/` in the chat can show command completions.
-
-| Command | Description |
-| --- | --- |
-| `/status` | Send the current account status immediately. |
-| `/accounts` | Alias for `/status`. |
-| `/daily` | Send the previous-day/current-day usage report. |
-| `/ping` | Check whether the daemon is receiving commands. |
-| `/help` | Show command help. |
-
-By default, commands are only accepted from `TELEGRAM_CHAT_ID`. To authorize multiple chats, set:
-
-```env
-TELEGRAM_ALLOWED_CHAT_IDS=123456789,-1001234567890
-```
-
-The daemon drops pending Telegram updates on first startup by default so old `/start` or `/status` messages are not replayed. Change this with `TELEGRAM_DROP_PENDING_UPDATES=false` if you want to process queued commands after first startup.
-
-## Manual commands
-
-```bash
-# Print the current account snapshot without sending Telegram.
-python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env account-summary
-
-# Force-send the current account snapshot to Telegram.
-python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env account-summary --notify
-
-# Run the same alert rules once: account changes, user recharges, and upstream errors.
-python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env run-once --notify
-
-# Force-send the daily usage report.
-python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env daily --notify
-
-# Register Telegram slash-command suggestions.
-python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env setup-telegram-commands
-
-# Keep monitoring in the foreground.
-python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env daemon
-```
-
-Systemd service:
+Systemd operations:
 
 ```bash
 sudo systemctl enable --now sub2api-monitor.service
@@ -194,51 +225,17 @@ sudo systemctl status sub2api-monitor.service
 sudo journalctl -u sub2api-monitor.service -f
 ```
 
-## Configuration
+For forks or pinned refs:
 
-Configuration file:
-
-```text
-/etc/sub2api-monitor/config.env
+```bash
+sudo UPDATE_REPO_URL=https://github.com/<owner>/<repo>.git \
+  UPDATE_REF=main \
+  /opt/sub2api-monitor/monitor.sh --update
 ```
 
-Important options:
+## 🧑‍💻 Development
 
-| Option | Default | Description |
-| --- | --- | --- |
-| `SUB2API_DIR` | `/opt/sub2api` | Sub2API deployment directory. The monitor reads its `.env` for PostgreSQL credentials. |
-| `POSTGRES_CONTAINER` | `sub2api-postgres` | PostgreSQL container name. |
-| `TELEGRAM_BOT_TOKEN` | empty | Telegram bot token. |
-| `TELEGRAM_CHAT_ID` | empty | Telegram chat/channel/user ID. |
-| `TELEGRAM_PARSE_MODE` | `HTML` | Telegram formatting mode for readable bold headings and code labels. |
-| `TELEGRAM_COMMANDS_ENABLED` | `true` | Enable `/status`, `/daily`, `/ping`, and `/help` command polling in daemon mode. |
-| `TELEGRAM_COMMAND_POLL_INTERVAL_SECONDS` | `5` | How often daemon mode checks Telegram commands. |
-| `TELEGRAM_ALLOWED_CHAT_IDS` | empty | Optional comma-separated allowlist; defaults to `TELEGRAM_CHAT_ID`. |
-| `POLL_INTERVAL_SECONDS` | `60` | Daemon polling interval. |
-| `USER_RECHARGE_ALERTS_ENABLED` | `true` | Send Telegram notifications when `users.total_recharged` increases. |
-| `ERROR_LOOKBACK_MINUTES` | `30` | Lookback window for new upstream errors. |
-| `ERROR_COOLDOWN_SECONDS` | `600` | Per-error-group cooldown. |
-| `UPSTREAM_ALLOWED_STATUS_CODES` | `429,500-599` | Upstream HTTP statuses that should alert. |
-| `PROXY_ERROR_ALERTS_ENABLED` | `true` | Separately alert likely exit-proxy/network failures from `ops_error_logs`. |
-| `REDACT_IDENTIFIERS` | `true` | Redact account names/emails in alerts. |
-| `DAILY_REPORT_HOUR` | `0` | Local hour for daily report. |
-| `DAILY_REPORT_MINUTE` | `0` | Local minute for daily report. |
-
-You can edit these with menu option `13) 交互式修改配置项`; option `14) 手动编辑配置文件（nano）` remains available for advanced/manual edits.
-
-See [`config.env.example`](./config.env.example) for the full set of options.
-
-## Security model
-
-- The monitor is read-only from Sub2API's perspective.
-- It does not modify Sub2API tables.
-- It does not send active probes to upstream providers.
-- Runtime configuration and secrets live outside the Git repository in `/etc/sub2api-monitor/config.env`.
-- The repository only includes `config.env.example`; do not commit real Telegram tokens or database credentials.
-
-## Development
-
-Run checks locally:
+Run local checks before committing:
 
 ```bash
 bash -n monitor.sh
@@ -246,6 +243,13 @@ python3 -m py_compile sub2api_monitor.py
 PYTHONPATH=. python3 -m unittest discover -v -s tests
 ```
 
-## License
+Recommended contribution checklist:
+
+- Keep changes passive and read-only against Sub2API data
+- Add or update tests for new alert logic
+- Keep examples redacted and placeholder-based
+- Do not commit runtime config, state files, logs, tokens, chat IDs, or database credentials
+
+## 📄 License
 
 MIT License. See [LICENSE](./LICENSE).
