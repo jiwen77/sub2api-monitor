@@ -1043,6 +1043,10 @@ def build_account_message(
         lines += ["", section("账号概览")]
         for key, bucket in sorted(buckets.items()):
             lines.append(format_summary_line(key, bucket, html_mode=True))
+        quota_lines = format_quota_summary_lines(rows)
+        if quota_lines:
+            lines += ["", section("额度汇总")]
+            lines.extend(quota_lines)
 
     abnormal = sorted([r for r in rows if not r.get("normal")], key=account_sort_key)
     if changed or added or removed:
@@ -1118,7 +1122,7 @@ def build_groups_message(rows: list[dict[str, Any]], cfg: Config) -> str:
     ]
     if buckets:
         for bucket in buckets[: cfg.detail_limit]:
-            lines.append(format_group_summary_line(bucket))
+            lines.append(format_group_summary_block(bucket))
         if len(buckets) > cfg.detail_limit:
             lines.append(muted(f"另有 {len(buckets) - cfg.detail_limit} 个分组未展开"))
     else:
@@ -1207,6 +1211,82 @@ def format_summary_line(key: tuple[str, str], bucket: dict[str, int], html_mode:
     return f"{icon} {label} {normal}/{total}" + (f" · {' · '.join(extras)}" if extras else "")
 
 
+def format_type_breakdown_line(key: tuple[str, str], bucket: dict[str, int], html_mode: bool = True) -> str:
+    platform, plan = key
+    total = max(int(bucket.get("total") or 0), 0)
+    normal = max(int(bucket.get("normal") or 0), 0)
+    extras = quota_health_extras(bucket)
+    label = f"{platform}/{plan}"
+    if html_mode:
+        base = f"{tg_code(label)} {normal}/{total}"
+        return base + (f" · {h(' · '.join(extras))}" if extras else "")
+    return f"{label} {normal}/{total}" + (f" · {' · '.join(extras)}" if extras else "")
+
+
+def quota_health_extras(bucket: dict[str, int]) -> list[str]:
+    extras = []
+    if bucket.get("rate_limited"):
+        extras.append(f"限流{bucket['rate_limited']}")
+    if bucket.get("error"):
+        extras.append(f"异常{bucket['error']}")
+    if bucket.get("overloaded"):
+        extras.append(f"过载{bucket['overloaded']}")
+    if bucket.get("temp"):
+        extras.append(f"临停{bucket['temp']}")
+    if bucket.get("expired"):
+        extras.append(f"过期{bucket['expired']}")
+    return extras
+
+
+def format_quota_summary_lines(rows: list[dict[str, Any]]) -> list[str]:
+    buckets = summarize_account_quota(rows)
+    lines: list[str] = []
+    for key in sorted(buckets):
+        quota = format_quota_totals(buckets[key])
+        if not quota:
+            continue
+        platform, plan = key
+        lines.append(f"{tg_code(f'{platform}/{plan}')}\n  {quota}")
+    return lines
+
+
+def summarize_account_quota(rows: Iterable[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Decimal]]:
+    buckets: dict[tuple[str, str], dict[str, Decimal]] = {}
+    for row in rows:
+        key = (str(row.get("platform") or "unknown"), str(row.get("plan") or "unknown"))
+        bucket = buckets.setdefault(key, {})
+        add_remaining_quota(bucket, "5h", row.get("codex_5h_used_percent"))
+        add_remaining_quota(bucket, "7d", row.get("codex_7d_used_percent"))
+        if not bucket:
+            buckets.pop(key, None)
+    return buckets
+
+
+def add_remaining_quota(bucket: dict[str, Decimal], label: str, used_percent: Any) -> None:
+    if used_percent is None:
+        return
+    remaining = Decimal("100") - decimal_value(used_percent)
+    if remaining < 0:
+        remaining = Decimal("0")
+    bucket[label] = bucket.get(label, Decimal("0")) + remaining
+
+
+def format_quota_totals(quota: dict[str, Decimal]) -> str:
+    parts = []
+    for label in ("5h", "7d"):
+        if label in quota:
+            parts.append(tg_code(f"{label} {fmt_percent_number(quota[label])}%"))
+    return h(" · ").join(parts)
+
+
+def fmt_percent_number(value: Any) -> str:
+    dec = decimal_value(value)
+    text = format(dec.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def summarize_account_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     buckets: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -1282,6 +1362,19 @@ def format_group_summary_line(bucket: dict[str, Any]) -> str:
     return line + (f" · {h(' · '.join(extras))}" if extras else "")
 
 
+def format_group_summary_block(bucket: dict[str, Any]) -> str:
+    lines = [format_group_summary_line(bucket)]
+    rows = list(bucket.get("rows") or [])
+    _summary_lines, type_buckets = summarize_accounts(rows)
+    quota_buckets = summarize_account_quota(rows)
+    for key, type_bucket in sorted(type_buckets.items()):
+        lines.append("  " + format_type_breakdown_line(key, type_bucket, html_mode=True))
+        quota = format_quota_totals(quota_buckets.get(key, {}))
+        if quota:
+            lines.append(f"    {h('额度')} {quota}")
+    return "\n".join(lines)
+
+
 def group_bucket_label(bucket: dict[str, Any]) -> str:
     return account_group_label(bucket.get("group") or {}) or "未分组"
 
@@ -1329,11 +1422,11 @@ def format_account_inline_row(row: dict[str, Any], cfg: Config) -> str:
         head_bits.append(h(name))
     head_bits.append(tg_code(label))
 
-    detail = describe_account_state(row, include_error=True)
-    quota = plain_account_quota_summary(row)
+    detail = h(describe_account_state(row, include_error=True))
+    quota = account_quota_summary(row)
     if quota:
-        detail += f" · {quota}"
-    return " ".join(head_bits) + f" — {h(detail)}"
+        detail += f" {h('·')} {quota}"
+    return " ".join(head_bits) + f" — {detail}"
 
 
 
@@ -1351,34 +1444,34 @@ def format_account_change_row(row: dict[str, Any], cfg: Config) -> str:
     details: list[str] = []
     old_label = f"{previous.get('platform') or 'unknown'}/{previous.get('plan') or 'unknown'}"
     if old_label != label:
-        details.append(f"平台/套餐：{old_label} → {label}")
+        details.append(h(f"平台/套餐：{old_label} → {label}"))
     old_type = str(previous.get("type") or "")
     new_type = str(row.get("type") or "")
     if old_type and new_type and old_type != new_type:
-        details.append(f"类型：{old_type} → {new_type}")
+        details.append(h(f"类型：{old_type} → {new_type}"))
 
     before = describe_account_state(previous, include_error=False)
     after = describe_account_state(row, include_error=True)
     if before != after:
-        details.append(f"状态：{before} → {after}")
+        details.append(h(f"状态：{before} → {after}"))
     elif previous.get("error_message_hash") and previous.get("error_message_hash") != account_digest(row).get("error_message_hash"):
-        details.append(f"状态：{before} → {after}（错误详情变化）")
+        details.append(h(f"状态：{before} → {after}（错误详情变化）"))
     elif not details:
-        details.append(f"状态细节更新：{after}")
+        details.append(h(f"状态细节更新：{after}"))
 
-    quota = plain_account_quota_summary(row)
+    quota = account_quota_summary(row)
     if quota:
-        details.append(f"当前用量：{quota}")
+        details.append(f"{h('当前用量：')}{quota}")
 
     old_groups = account_groups_summary(previous)
     new_groups = account_groups_summary(row)
     if old_groups or new_groups:
         if old_groups and old_groups != new_groups:
-            details.append(f"所属分组：{old_groups} → {new_groups or '未分组'}")
+            details.append(h(f"所属分组：{old_groups} → {new_groups or '未分组'}"))
         else:
-            details.append(f"所属分组：{new_groups or old_groups}")
+            details.append(h(f"所属分组：{new_groups or old_groups}"))
 
-    return " ".join(head_bits) + "\n  " + "\n  ".join(h(detail) for detail in details)
+    return " ".join(head_bits) + "\n  " + "\n  ".join(details)
 
 def account_icon(row: dict[str, Any]) -> str:
     if row.get("status") not in ("active", ""):
@@ -1419,14 +1512,38 @@ def describe_account_state(row: dict[str, Any], include_error: bool = True) -> s
 def plain_account_quota_summary(row: dict[str, Any]) -> str:
     parts = []
     if row.get("codex_5h_used_percent") is not None:
-        parts.append(f"5h {row.get('codex_5h_used_percent')}%")
+        parts.append(format_account_quota_part("5h", row.get("codex_5h_used_percent"), row))
     if row.get("codex_7d_used_percent") is not None:
-        parts.append(f"7d {row.get('codex_7d_used_percent')}%")
+        parts.append(format_account_quota_part("7d", row.get("codex_7d_used_percent"), row))
     return " · ".join(parts)
 
 
 def account_quota_summary(row: dict[str, Any]) -> str:
-    return h(plain_account_quota_summary(row))
+    parts = []
+    if row.get("codex_5h_used_percent") is not None:
+        parts.append(format_account_quota_part("5h", row.get("codex_5h_used_percent"), row, html_mode=True))
+    if row.get("codex_7d_used_percent") is not None:
+        parts.append(format_account_quota_part("7d", row.get("codex_7d_used_percent"), row, html_mode=True))
+    return h(" · ").join(parts)
+
+
+def format_account_quota_part(label: str, value: Any, row: dict[str, Any], html_mode: bool = False) -> str:
+    value_text = f"{label} {value}%"
+    text = tg_code(value_text) if html_mode else value_text
+    if is_possibly_unrefreshed_normal_quota(row, value):
+        text += "（可能未刷新）"
+    return text
+
+
+def is_possibly_unrefreshed_normal_quota(row: dict[str, Any], value: Any) -> bool:
+    # Sub2API stores Codex quota percentages as account extra snapshots. After
+    # rate_limit_reset_at expires, the account can already be schedulable again
+    # while a 100% quota snapshot has not been refreshed yet.
+    return (
+        bool(row.get("normal"))
+        and not bool(row.get("rate_limited"))
+        and decimal_value(value) >= Decimal("100")
+    )
 
 
 def normalized_account_groups(row: dict[str, Any]) -> list[dict[str, Any]]:

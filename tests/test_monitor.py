@@ -191,8 +191,46 @@ class PredicateTests(unittest.TestCase):
 
         self.assertIn("本次变化", message)
         self.assertIn("状态：限流至 06-05 12:49 → 正常", message)
-        self.assertIn("当前用量：5h 100.0% · 7d 46.0%", message)
+        self.assertIn("当前用量：<code>5h 100.0%</code>（可能未刷新） · <code>7d 46.0%</code>", message)
         self.assertNotIn("当前需要关注", message)
+
+    def test_normal_full_quota_marks_all_windows_as_waiting_refresh(self):
+        row = {
+            "status": "active",
+            "normal": True,
+            "schedulable": True,
+            "rate_limited": False,
+            "codex_5h_used_percent": 100,
+            "codex_7d_used_percent": 100,
+        }
+
+        self.assertEqual(
+            m.account_quota_summary(row),
+            "<code>5h 100%</code>（可能未刷新） · <code>7d 100%</code>（可能未刷新）",
+        )
+        self.assertEqual(
+            m.plain_account_quota_summary(row),
+            "5h 100%（可能未刷新） · 7d 100%（可能未刷新）",
+        )
+
+    def test_active_limited_full_quota_does_not_mark_waiting_refresh(self):
+        row = {
+            "status": "active",
+            "normal": False,
+            "schedulable": False,
+            "rate_limited": True,
+            "codex_5h_used_percent": 100,
+            "codex_7d_used_percent": 100,
+        }
+
+        self.assertEqual(
+            m.account_quota_summary(row),
+            "<code>5h 100%</code> · <code>7d 100%</code>",
+        )
+        self.assertEqual(
+            m.plain_account_quota_summary(row),
+            "5h 100% · 7d 100%",
+        )
 
     def test_user_recharge_message_redacts_and_summarizes(self):
         cfg = m.Config()
@@ -549,6 +587,64 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("正常", message)
         self.assertNotIn("当前需要关注", message)
 
+    def test_status_summary_includes_non_redundant_quota_totals(self):
+        cfg = m.Config()
+        rows = [
+            {
+                "id": 108,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "active",
+                "normal": True,
+                "schedulable": True,
+                "rate_limited": False,
+                "codex_5h_used_percent": 25,
+                "codex_7d_used_percent": 50,
+            },
+            {
+                "id": 109,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "active",
+                "normal": False,
+                "schedulable": False,
+                "rate_limited": True,
+                "codex_5h_used_percent": 100,
+                "codex_7d_used_percent": 36,
+            },
+            {
+                "id": 110,
+                "platform": "openai",
+                "plan": "free",
+                "status": "active",
+                "normal": True,
+                "schedulable": True,
+                "rate_limited": False,
+                "codex_5h_used_percent": 0,
+                "codex_7d_used_percent": 100,
+            },
+            {
+                "id": 111,
+                "platform": "openai",
+                "plan": "apikey",
+                "status": "active",
+                "normal": True,
+                "schedulable": True,
+                "rate_limited": False,
+            },
+        ]
+
+        message = m.build_account_message(rows, [], [], [], cfg, title="test", include_abnormal=False, clamp=False)
+
+        self.assertIn("账号概览", message)
+        self.assertIn("🟡 <code>openai/plus</code> 1/2 · 限流1", message)
+        self.assertIn("🟢 <code>openai/apikey</code> 1/1", message)
+        self.assertIn("额度汇总", message)
+        self.assertIn("<code>openai/plus</code>\n  <code>5h 75%</code> · <code>7d 114%</code>", message)
+        self.assertIn("<code>openai/free</code>\n  <code>5h 100%</code> · <code>7d 0%</code>", message)
+        self.assertNotIn("<code>openai/plus</code> 可用 1/2", message)
+        self.assertNotIn("<code>openai/apikey</code>\n  <code>5h", message)
+
     def test_account_group_summary_limits_many_groups_cleanly(self):
         row = {
             "groups": [
@@ -658,6 +754,53 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("需要关注的账号（去重，1 个）", message)
         self.assertEqual(message.count("#101"), 1)
         self.assertIn("所属分组：default、vip", message)
+
+    def test_groups_message_breaks_health_and_quota_down_by_account_type(self):
+        cfg = m.Config()
+        rows = [
+            {
+                "id": 108,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "active",
+                "normal": True,
+                "schedulable": True,
+                "rate_limited": False,
+                "codex_5h_used_percent": 25,
+                "codex_7d_used_percent": 50,
+                "groups": [{"id": 1, "name": "default", "status": "active"}],
+            },
+            {
+                "id": 109,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "active",
+                "normal": False,
+                "schedulable": False,
+                "rate_limited": True,
+                "codex_5h_used_percent": 100,
+                "codex_7d_used_percent": 36,
+                "groups": [{"id": 1, "name": "default", "status": "active"}],
+            },
+            {
+                "id": 110,
+                "platform": "openai",
+                "plan": "apikey",
+                "status": "active",
+                "normal": True,
+                "schedulable": True,
+                "rate_limited": False,
+                "groups": [{"id": 1, "name": "default", "status": "active"}],
+            },
+        ]
+
+        message = m.build_groups_message(rows, cfg)
+
+        self.assertIn("<code>default</code> 2/3 · 限流1", message)
+        self.assertIn("  <code>openai/apikey</code> 1/1", message)
+        self.assertIn("  <code>openai/plus</code> 1/2 · 限流1", message)
+        self.assertIn("    额度 <code>5h 75%</code> · <code>7d 114%</code>", message)
+        self.assertNotIn("APIKey可用", message)
 
     def test_daily_message_keeps_yesterday_and_today_details_separate(self):
         cfg = m.Config()
