@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -42,9 +44,13 @@ TELEGRAM_BOT_COMMANDS = [
     {"command": "accounts", "description": "账号清单"},
     {"command": "groups", "description": "分组概览"},
     {"command": "daily", "description": "昨日/今日用量日报"},
+    {"command": "update", "description": "检查程序更新"},
     {"command": "ping", "description": "检查 bot 是否在线"},
     {"command": "help", "description": "显示帮助"},
 ]
+DEFAULT_UPDATE_REPO_URL = "https://github.com/jiwen77/sub2api-monitor.git"
+DEFAULT_UPDATE_REF = "main"
+UPDATE_CALLBACK_DATA = "sub2api:update:run"
 DEFAULT_CONFIG_PATHS = (
     "/etc/sub2api-monitor/config.env",
     "/opt/sub2api-monitor/config.env",
@@ -345,6 +351,11 @@ class Monitor:
         self.save()
 
     def handle_telegram_update(self, update: dict[str, Any]) -> None:
+        callback_query = update.get("callback_query")
+        if isinstance(callback_query, dict):
+            self.handle_telegram_callback(callback_query)
+            return
+
         message = update.get("message")
         if not isinstance(message, dict):
             return
@@ -377,6 +388,10 @@ class Monitor:
                 tz = self.cfg.tzinfo()
                 day = dt.datetime.now(tz).date() - dt.timedelta(days=1)
                 self.send(self.build_daily_report(day), chat_id=chat_id)
+            elif command in {"/update", "/upgrade"}:
+                status = self.check_update_status()
+                reply_markup = build_update_reply_markup() if status.get("has_update") else None
+                self.send(build_update_status_message(status, self.cfg.tzinfo()), chat_id=chat_id, reply_markup=reply_markup)
             elif command == "/ping":
                 self.send("🏓 <b>pong</b>\n" + muted(now_iso(self.cfg.tzinfo())), chat_id=chat_id)
             else:
@@ -384,6 +399,116 @@ class Monitor:
         except Exception:
             logging.exception("telegram command handling failed: %s", command)
             self.send(build_simple_alert("⚠️ Telegram 命令执行失败", short_exc(), self.cfg), chat_id=chat_id)
+
+    def handle_telegram_callback(self, callback_query: dict[str, Any]) -> None:
+        callback_query_id = str(callback_query.get("id") or "")
+        data = str(callback_query.get("data") or "")
+        message = callback_query.get("message")
+        chat_id = ""
+        if isinstance(message, dict) and isinstance(message.get("chat"), dict):
+            chat_id = str(message["chat"].get("id") or "").strip()
+        if not chat_id or not telegram_chat_allowed(self.cfg, chat_id):
+            logging.warning("ignored telegram callback from unauthorized chat_id=%s", chat_id or "-")
+            if callback_query_id:
+                self.answer_callback_query(callback_query_id, "无权限")
+            return
+
+        if data != UPDATE_CALLBACK_DATA:
+            if callback_query_id:
+                self.answer_callback_query(callback_query_id, "未知操作")
+            return
+
+        try:
+            status = self.check_update_status()
+            if status.get("error"):
+                if callback_query_id:
+                    self.answer_callback_query(callback_query_id, "检查失败")
+                self.send(build_update_status_message(status, self.cfg.tzinfo()), chat_id=chat_id)
+                return
+            if not status.get("has_update"):
+                if callback_query_id:
+                    self.answer_callback_query(callback_query_id, "已是最新版")
+                self.send(build_update_status_message(status, self.cfg.tzinfo()), chat_id=chat_id)
+                return
+
+            log_path = self.trigger_self_update()
+            if callback_query_id:
+                self.answer_callback_query(callback_query_id, "开始更新")
+            self.send(build_update_triggered_message(status, log_path, self.cfg.tzinfo()), chat_id=chat_id)
+        except Exception:
+            logging.exception("telegram update callback failed")
+            if callback_query_id:
+                self.answer_callback_query(callback_query_id, "更新失败")
+            self.send(build_simple_alert("⚠️ 程序更新触发失败", short_exc(), self.cfg), chat_id=chat_id)
+
+    def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
+        if self.dry_run or not self.cfg.telegram_bot_token:
+            logging.info("[dry-run callback answer] id=%s text=%s", callback_query_id, text)
+            return
+        answer_telegram_callback(self.cfg, callback_query_id, text)
+
+    def check_update_status(self) -> dict[str, Any]:
+        local_version = current_install_version()
+        repo_url = os.environ.get("UPDATE_REPO_URL", DEFAULT_UPDATE_REPO_URL)
+        ref = os.environ.get("UPDATE_REF", DEFAULT_UPDATE_REF)
+        remote_version = ""
+        error = ""
+        try:
+            remote_version = remote_git_version(repo_url, ref)
+        except Exception as exc:
+            error = truncate(str(exc), 300)
+        has_update = bool(local_version and remote_version and local_version != remote_version)
+        return {
+            "local_version": local_version,
+            "remote_version": remote_version,
+            "repo_url": repo_url,
+            "ref": ref,
+            "has_update": has_update,
+            "error": error,
+        }
+
+    def trigger_self_update(self) -> str:
+        script = Path(__file__).resolve().parent / "monitor.sh"
+        if not script.exists():
+            raise RuntimeError(f"update script not found: {script}")
+        log_path = Path(self.cfg.log_file).parent / "update-from-telegram.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        systemd_run = shutil.which("systemd-run")
+        if systemd_run:
+            unit = f"sub2api-monitor-self-update-{int(time.time())}"
+            shell_cmd = f"exec {shlex.quote(str(script))} --update >> {shlex.quote(str(log_path))} 2>&1"
+            proc = subprocess.run(
+                [
+                    systemd_run,
+                    "--unit",
+                    unit,
+                    "--collect",
+                    "--description",
+                    "Sub2API Monitor Telegram self-update",
+                    "/bin/bash",
+                    "-lc",
+                    shell_cmd,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode == 0:
+                return str(log_path)
+            logging.warning("systemd-run update launch failed rc=%s: %s", proc.returncode, proc.stderr.strip()[:300])
+
+        with log_path.open("ab") as log:
+            subprocess.Popen(
+                [str(script), "--update"],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                start_new_session=True,
+            )
+        return str(log_path)
 
     def query_json(self, sql: str) -> Any:
         raw = self.psql(sql)
@@ -801,8 +926,8 @@ SELECT json_build_object(
 """
         return self.query_json(sql) or {"summary": {}, "by_plan": [], "top_models": []}
 
-    def send(self, text: str, chat_id: str | None = None) -> None:
-        send_telegram(self.cfg, text, dry_run=self.dry_run, chat_id=chat_id)
+    def send(self, text: str, chat_id: str | None = None, reply_markup: dict[str, Any] | None = None) -> None:
+        send_telegram(self.cfg, text, dry_run=self.dry_run, chat_id=chat_id, reply_markup=reply_markup)
 
 
 # ----------------------------- formatting helpers -----------------------------
@@ -1661,7 +1786,13 @@ def proxy_error_key(row: dict[str, Any]) -> str:
 # ------------------------------- telegram ------------------------------------
 
 
-def send_telegram(cfg: Config, text: str, dry_run: bool = False, chat_id: str | None = None) -> None:
+def send_telegram(
+    cfg: Config,
+    text: str,
+    dry_run: bool = False,
+    chat_id: str | None = None,
+    reply_markup: dict[str, Any] | None = None,
+) -> None:
     target_chat_id = str(chat_id or cfg.telegram_chat_id or "").strip()
     chunks = split_message(text)
     if dry_run or not (cfg.telegram_bot_token and target_chat_id):
@@ -1670,7 +1801,7 @@ def send_telegram(cfg: Config, text: str, dry_run: bool = False, chat_id: str | 
             logging.info("%s chat_id=%s message_len=%s", prefix, target_chat_id or "-", len(chunk))
             print(f"{prefix} chat_id={target_chat_id or '-'}\n{render_for_terminal(chunk)}\n")
         return
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
         payload = {
             "chat_id": target_chat_id,
             "text": chunk,
@@ -1678,6 +1809,8 @@ def send_telegram(cfg: Config, text: str, dry_run: bool = False, chat_id: str | 
         }
         if cfg.telegram_parse_mode:
             payload["parse_mode"] = cfg.telegram_parse_mode
+        if reply_markup and index == 0:
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
         try:
             telegram_api_request(cfg, "sendMessage", payload, timeout_seconds=20)
             logging.info("telegram sent: %s bytes to chat_id=%s", len(chunk.encode("utf-8")), target_chat_id)
@@ -1701,7 +1834,7 @@ def set_telegram_bot_commands(cfg: Config, dry_run: bool = False) -> None:
 def telegram_get_updates(cfg: Config, offset: int | None, timeout_seconds: int = 0) -> list[dict[str, Any]]:
     payload: dict[str, Any] = {
         "timeout": str(max(0, int(timeout_seconds))),
-        "allowed_updates": json.dumps(["message"]),
+        "allowed_updates": json.dumps(["message", "callback_query"]),
     }
     if offset is not None and offset > 0:
         payload["offset"] = str(offset)
@@ -1710,6 +1843,13 @@ def telegram_get_updates(cfg: Config, offset: int | None, timeout_seconds: int =
     if not isinstance(result, list):
         return []
     return [update for update in result if isinstance(update, dict)]
+
+
+def answer_telegram_callback(cfg: Config, callback_query_id: str, text: str = "") -> None:
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = truncate(text, 200)
+    telegram_api_request(cfg, "answerCallbackQuery", payload, timeout_seconds=10)
 
 
 def telegram_api_request(cfg: Config, method: str, payload: dict[str, Any], timeout_seconds: int = 20) -> dict[str, Any]:
@@ -1749,6 +1889,112 @@ def build_command_help() -> str:
     for command in TELEGRAM_BOT_COMMANDS:
         lines.append(f"{tg_code('/' + command['command'])} {h(command['description'])}")
     return "\n".join(lines)
+
+
+def build_update_reply_markup() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [{"text": "立即更新", "callback_data": UPDATE_CALLBACK_DATA}],
+        ]
+    }
+
+
+def build_update_status_message(status: dict[str, Any], tz: dt.tzinfo | None = None) -> str:
+    local_version = short_git_version(status.get("local_version"))
+    remote_version = short_git_version(status.get("remote_version"))
+    ref = str(status.get("ref") or DEFAULT_UPDATE_REF)
+    lines = [
+        "🔄 <b>Sub2API Monitor 更新检查</b>",
+        muted(now_iso(tz or Config().tzinfo())),
+        h(f"分支/标签：{ref}"),
+        h(f"当前版本：{local_version}"),
+    ]
+    if status.get("error"):
+        lines += ["", h("检查失败：" + str(status.get("error")))]
+    elif status.get("has_update"):
+        lines += [
+            h(f"远端版本：{remote_version}"),
+            "",
+            h("发现新版本，点击下方按钮开始更新。"),
+        ]
+    else:
+        lines += [
+            h(f"远端版本：{remote_version}"),
+            "",
+            h("当前已是最新版本。"),
+        ]
+    return "\n".join(lines)
+
+
+def build_update_triggered_message(status: dict[str, Any], log_path: str, tz: dt.tzinfo | None = None) -> str:
+    return "\n".join([
+        "🚀 <b>已触发更新</b>",
+        muted(now_iso(tz or Config().tzinfo())),
+        h(f"{short_git_version(status.get('local_version'))} → {short_git_version(status.get('remote_version'))}"),
+        h(f"日志：{log_path}"),
+        h("服务会由更新脚本自动重启。"),
+    ])
+
+
+def current_install_version() -> str:
+    version_file = Path(__file__).resolve().parent / ".version"
+    try:
+        value = version_file.read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"[0-9a-f]{40}", value):
+            return value
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logging.exception("failed to read version file: %s", version_file)
+
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        value = proc.stdout.strip()
+        if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", value):
+            return value
+    except Exception:
+        logging.exception("failed to read git version")
+    return "unknown"
+
+
+def remote_git_version(repo_url: str, ref: str) -> str:
+    proc = subprocess.run(
+        ["git", "ls-remote", repo_url, ref],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git ls-remote failed rc={proc.returncode}: {proc.stderr.strip()[:300]}")
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == f"refs/heads/{ref}":
+            return parts[0]
+        if len(parts) >= 2 and parts[1] == ref:
+            return parts[0]
+    first = proc.stdout.split()
+    if first and re.fullmatch(r"[0-9a-f]{40}", first[0]):
+        return first[0]
+    raise RuntimeError(f"remote ref not found: {shlex.quote(ref)}")
+
+
+def short_git_version(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    if len(text) >= 8 and re.fullmatch(r"[0-9a-fA-F]{8,40}", text):
+        return text[:8]
+    return text
 
 
 def build_unknown_command(command: str) -> str:

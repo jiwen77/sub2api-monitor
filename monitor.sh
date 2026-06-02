@@ -87,6 +87,8 @@ update_from_github() {
   trap 'rm -rf "$tmp"' RETURN
 
   git clone --depth 1 --branch "$UPDATE_REF" "$UPDATE_REPO_URL" "$tmp/repo"
+  local update_commit
+  update_commit=$(git -C "$tmp/repo" rev-parse HEAD)
 
   if [[ ! -f "$tmp/repo/sub2api_monitor.py" || ! -f "$tmp/repo/monitor.sh" ]]; then
     echo -e "${red}仓库内容不完整，未安装。${reset}"
@@ -99,6 +101,7 @@ update_from_github() {
     --exclude '__pycache__/' \
     --exclude '*.pyc' \
     "$tmp/repo/" "$INSTALL_DIR/"
+  printf '%s\n' "$update_commit" > "$INSTALL_DIR/.version"
   chmod +x "$INSTALL_DIR/sub2api_monitor.py" "$INSTALL_DIR/monitor.sh"
 
   if [[ ! -f "$CONFIG_FILE" ]]; then

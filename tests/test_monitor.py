@@ -272,6 +272,7 @@ class PredicateTests(unittest.TestCase):
             self.assertRegex(command["command"], r"^[a-z0-9_]{1,32}$")
             self.assertGreaterEqual(len(command["description"]), 1)
             self.assertLessEqual(len(command["description"]), 256)
+        self.assertIn({"command": "update", "description": "检查程序更新"}, m.TELEGRAM_BOT_COMMANDS)
 
     def test_set_telegram_bot_commands_payload(self):
         calls = []
@@ -293,6 +294,70 @@ class PredicateTests(unittest.TestCase):
         commands = m.json.loads(payload["commands"])
         self.assertEqual(commands, m.TELEGRAM_BOT_COMMANDS)
         self.assertEqual(timeout_seconds, 20)
+
+    def test_send_telegram_can_include_inline_keyboard(self):
+        calls = []
+        original = m.telegram_api_request
+        reply_markup = {
+            "inline_keyboard": [
+                [{"text": "立即更新", "callback_data": "sub2api:update:run"}],
+            ]
+        }
+
+        def fake_request(cfg, method, payload, timeout_seconds=20):
+            calls.append((method, payload, timeout_seconds))
+            return {"ok": True, "result": True}
+
+        try:
+            m.telegram_api_request = fake_request
+            m.send_telegram(
+                m.Config(telegram_bot_token="123:token"),
+                "发现新版本",
+                chat_id="123",
+                reply_markup=reply_markup,
+            )
+        finally:
+            m.telegram_api_request = original
+
+        self.assertEqual(len(calls), 1)
+        method, payload, _timeout_seconds = calls[0]
+        self.assertEqual(method, "sendMessage")
+        self.assertEqual(m.json.loads(payload["reply_markup"]), reply_markup)
+
+    def test_telegram_get_updates_accepts_callback_queries(self):
+        calls = []
+        original = m.telegram_api_request
+
+        def fake_request(cfg, method, payload, timeout_seconds=20):
+            calls.append((method, payload, timeout_seconds))
+            return {"ok": True, "result": []}
+
+        try:
+            m.telegram_api_request = fake_request
+            self.assertEqual(m.telegram_get_updates(m.Config(telegram_bot_token="123:token"), offset=10), [])
+        finally:
+            m.telegram_api_request = original
+
+        _method, payload, _timeout_seconds = calls[0]
+        self.assertIn("callback_query", m.json.loads(payload["allowed_updates"]))
+
+    def test_answer_telegram_callback_payload(self):
+        calls = []
+        original = m.telegram_api_request
+
+        def fake_request(cfg, method, payload, timeout_seconds=20):
+            calls.append((method, payload, timeout_seconds))
+            return {"ok": True, "result": True}
+
+        try:
+            m.telegram_api_request = fake_request
+            m.answer_telegram_callback(m.Config(telegram_bot_token="123:token"), "cb-1", "开始更新")
+        finally:
+            m.telegram_api_request = original
+
+        self.assertEqual(calls[0][0], "answerCallbackQuery")
+        self.assertEqual(calls[0][1]["callback_query_id"], "cb-1")
+        self.assertEqual(calls[0][1]["text"], "开始更新")
 
     def test_change_alert_can_hide_summary_and_abnormal_list(self):
         cfg = m.Config()
@@ -680,3 +745,74 @@ class TelegramCommandTests(unittest.TestCase):
         self.assertIn("分组概览", text)
         self.assertIn("default", text)
         self.assertIn("#101", text)
+
+    def test_update_command_sends_button_when_remote_version_is_newer(self):
+        class FakeMonitor(m.Monitor):
+            def __init__(self, cfg):
+                self.sent = []
+                super().__init__(cfg, dry_run=True)
+
+            def check_update_status(self):
+                return {
+                    "local_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "remote_version": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "has_update": True,
+                    "error": "",
+                }
+
+            def send(self, text, chat_id=None, reply_markup=None):
+                self.sent.append((text, chat_id, reply_markup))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mon = FakeMonitor(m.Config(state_file=f"{tmp}/state.json", telegram_chat_id="123"))
+            mon.handle_telegram_update({"message": {"chat": {"id": "123"}, "text": "/update"}})
+
+        self.assertEqual(len(mon.sent), 1)
+        text, chat_id, reply_markup = mon.sent[0]
+        self.assertEqual(chat_id, "123")
+        self.assertIn("发现新版本", text)
+        self.assertIn("aaaaaaaa", text)
+        self.assertIn("bbbbbbbb", text)
+        self.assertEqual(reply_markup["inline_keyboard"][0][0]["text"], "立即更新")
+        self.assertEqual(reply_markup["inline_keyboard"][0][0]["callback_data"], "sub2api:update:run")
+
+    def test_update_callback_rechecks_then_triggers_update(self):
+        class FakeMonitor(m.Monitor):
+            def __init__(self, cfg):
+                self.sent = []
+                self.answered = []
+                self.triggered = False
+                super().__init__(cfg, dry_run=True)
+
+            def check_update_status(self):
+                return {
+                    "local_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "remote_version": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "has_update": True,
+                    "error": "",
+                }
+
+            def trigger_self_update(self):
+                self.triggered = True
+                return "/var/log/sub2api-monitor/update-from-telegram.log"
+
+            def answer_callback_query(self, callback_query_id, text=""):
+                self.answered.append((callback_query_id, text))
+
+            def send(self, text, chat_id=None, reply_markup=None):
+                self.sent.append((text, chat_id, reply_markup))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mon = FakeMonitor(m.Config(state_file=f"{tmp}/state.json", telegram_chat_id="123"))
+            mon.handle_telegram_update({
+                "callback_query": {
+                    "id": "cb-1",
+                    "data": "sub2api:update:run",
+                    "message": {"chat": {"id": "123"}},
+                }
+            })
+
+        self.assertTrue(mon.triggered)
+        self.assertEqual(mon.answered, [("cb-1", "开始更新")])
+        self.assertIn("已触发更新", mon.sent[0][0])
+        self.assertEqual(mon.sent[0][1], "123")
