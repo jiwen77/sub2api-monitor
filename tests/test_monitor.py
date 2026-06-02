@@ -663,6 +663,71 @@ class PredicateTests(unittest.TestCase):
         self.assertNotIn("<code>openai/plus</code> 可用 1/2", message)
         self.assertNotIn("<code>openai/apikey</code>\n  <code>5h", message)
 
+    def test_quota_summary_keeps_rate_limited_but_excludes_unusable_accounts(self):
+        rows = [
+            {
+                "id": 108,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "active",
+                "normal": True,
+                "schedulable": True,
+                "rate_limited": False,
+                "codex_5h_used_percent": 25,
+                "codex_7d_used_percent": 50,
+            },
+            {
+                "id": 109,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "active",
+                "normal": False,
+                "schedulable": False,
+                "rate_limited": True,
+                "codex_5h_used_percent": 100,
+                "codex_7d_used_percent": 36,
+            },
+            {
+                "id": 110,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "error",
+                "normal": False,
+                "schedulable": True,
+                "rate_limited": False,
+                "codex_5h_used_percent": 1,
+                "codex_7d_used_percent": 1,
+            },
+            {
+                "id": 111,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "active",
+                "normal": False,
+                "schedulable": False,
+                "rate_limited": False,
+                "codex_5h_used_percent": 2,
+                "codex_7d_used_percent": 2,
+            },
+            {
+                "id": 112,
+                "platform": "openai",
+                "plan": "plus",
+                "status": "active",
+                "normal": False,
+                "schedulable": True,
+                "rate_limited": False,
+                "expired": True,
+                "codex_5h_used_percent": 3,
+                "codex_7d_used_percent": 3,
+            },
+        ]
+
+        self.assertEqual(
+            m.format_quota_summary_lines(rows),
+            ["<code>openai/plus</code>\n  <code>5h 75%</code> · <code>7d 114%</code>"],
+        )
+
     def test_account_group_summary_limits_many_groups_cleanly(self):
         row = {
             "groups": [

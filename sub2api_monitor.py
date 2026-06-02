@@ -1271,6 +1271,8 @@ def format_quota_summary_lines(rows: list[dict[str, Any]]) -> list[str]:
 def summarize_account_quota(rows: Iterable[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Decimal]]:
     buckets: dict[tuple[str, str], dict[str, Decimal]] = {}
     for row in rows:
+        if not is_quota_summary_eligible(row):
+            continue
         key = (str(row.get("platform") or "unknown"), str(row.get("plan") or "unknown"))
         bucket = buckets.setdefault(key, {})
         add_remaining_quota(bucket, "5h", row.get("codex_5h_used_percent"))
@@ -1278,6 +1280,14 @@ def summarize_account_quota(rows: Iterable[dict[str, Any]]) -> dict[tuple[str, s
         if not bucket:
             buckets.pop(key, None)
     return buckets
+
+
+def is_quota_summary_eligible(row: dict[str, Any]) -> bool:
+    if row.get("status") != "active":
+        return False
+    if row.get("expired") or row.get("overloaded") or row.get("temp_unschedulable"):
+        return False
+    return bool(row.get("schedulable")) or bool(row.get("rate_limited"))
 
 
 def add_remaining_quota(bucket: dict[str, Decimal], label: str, used_percent: Any) -> None:
