@@ -632,14 +632,32 @@ class PredicateTests(unittest.TestCase):
                 "schedulable": True,
                 "rate_limited": False,
             },
+            {
+                "id": 112,
+                "platform": "openai",
+                "plan": "apikey",
+                "status": "error",
+                "normal": False,
+                "schedulable": True,
+                "rate_limited": False,
+            },
+            {
+                "id": 113,
+                "platform": "openai",
+                "plan": "apikey",
+                "status": "active",
+                "normal": False,
+                "schedulable": False,
+                "rate_limited": False,
+            },
         ]
 
         message = m.build_account_message(rows, [], [], [], cfg, title="test", include_abnormal=False, clamp=False)
 
         self.assertIn("账号概览", message)
         self.assertIn("🟡 <code>openai/plus</code> 1/2 · 限流1", message)
-        self.assertIn("🟢 <code>openai/apikey</code> 1/1", message)
-        self.assertIn("额度汇总", message)
+        self.assertIn("🟡 <code>openai/apikey</code> 1/3 · 异常1 · 不可调度1", message)
+        self.assertIn("剩余额度汇总", message)
         self.assertIn("<code>openai/plus</code>\n  <code>5h 75%</code> · <code>7d 114%</code>", message)
         self.assertIn("<code>openai/free</code>\n  <code>5h 100%</code> · <code>7d 0%</code>", message)
         self.assertNotIn("<code>openai/plus</code> 可用 1/2", message)
@@ -792,14 +810,24 @@ class PredicateTests(unittest.TestCase):
                 "rate_limited": False,
                 "groups": [{"id": 1, "name": "default", "status": "active"}],
             },
+            {
+                "id": 111,
+                "platform": "openai",
+                "plan": "apikey",
+                "status": "active",
+                "normal": False,
+                "schedulable": False,
+                "rate_limited": False,
+                "groups": [{"id": 1, "name": "default", "status": "active"}],
+            },
         ]
 
         message = m.build_groups_message(rows, cfg)
 
-        self.assertIn("<code>default</code> 2/3 · 限流1", message)
-        self.assertIn("  <code>openai/apikey</code> 1/1", message)
+        self.assertIn("<code>default</code> 2/4 · 限流1 · 不可调度1", message)
+        self.assertIn("  <code>openai/apikey</code> 1/2 · 不可调度1", message)
         self.assertIn("  <code>openai/plus</code> 1/2 · 限流1", message)
-        self.assertIn("    额度 <code>5h 75%</code> · <code>7d 114%</code>", message)
+        self.assertIn("    剩余额度 <code>5h 75%</code> · <code>7d 114%</code>", message)
         self.assertNotIn("APIKey可用", message)
 
     def test_daily_message_keeps_yesterday_and_today_details_separate(self):

@@ -1002,7 +1002,19 @@ def summarize_accounts(rows: list[dict[str, Any]]) -> tuple[list[str], dict[tupl
     buckets: dict[tuple[str, str], dict[str, int]] = {}
     for row in rows:
         key = (str(row.get("platform") or "unknown"), str(row.get("plan") or "unknown"))
-        b = buckets.setdefault(key, {"normal": 0, "total": 0, "rate_limited": 0, "error": 0, "overloaded": 0, "temp": 0, "expired": 0})
+        b = buckets.setdefault(
+            key,
+            {
+                "normal": 0,
+                "total": 0,
+                "rate_limited": 0,
+                "error": 0,
+                "overloaded": 0,
+                "temp": 0,
+                "expired": 0,
+                "unschedulable": 0,
+            },
+        )
         b["total"] += 1
         if row.get("normal"):
             b["normal"] += 1
@@ -1016,6 +1028,8 @@ def summarize_accounts(rows: list[dict[str, Any]]) -> tuple[list[str], dict[tupl
             b["temp"] += 1
         if row.get("expired"):
             b["expired"] += 1
+        if is_plain_unschedulable(row):
+            b["unschedulable"] += 1
     lines: list[str] = []
     for key, b in sorted(buckets.items()):
         lines.append(format_summary_line(key, b, html_mode=False))
@@ -1045,7 +1059,7 @@ def build_account_message(
             lines.append(format_summary_line(key, bucket, html_mode=True))
         quota_lines = format_quota_summary_lines(rows)
         if quota_lines:
-            lines += ["", section("额度汇总")]
+            lines += ["", section("剩余额度汇总")]
             lines.extend(quota_lines)
 
     abnormal = sorted([r for r in rows if not r.get("normal")], key=account_sort_key)
@@ -1192,17 +1206,7 @@ def format_summary_line(key: tuple[str, str], bucket: dict[str, int], html_mode:
     platform, plan = key
     total = max(int(bucket.get("total") or 0), 0)
     normal = max(int(bucket.get("normal") or 0), 0)
-    extras = []
-    if bucket.get("rate_limited"):
-        extras.append(f"限流{bucket['rate_limited']}")
-    if bucket.get("error"):
-        extras.append(f"异常{bucket['error']}")
-    if bucket.get("overloaded"):
-        extras.append(f"过载{bucket['overloaded']}")
-    if bucket.get("temp"):
-        extras.append(f"临停{bucket['temp']}")
-    if bucket.get("expired"):
-        extras.append(f"过期{bucket['expired']}")
+    extras = quota_health_extras(bucket)
     icon = summary_icon(normal, total, extras)
     label = f"{platform}/{plan}"
     if html_mode:
@@ -1235,7 +1239,21 @@ def quota_health_extras(bucket: dict[str, int]) -> list[str]:
         extras.append(f"临停{bucket['temp']}")
     if bucket.get("expired"):
         extras.append(f"过期{bucket['expired']}")
+    if bucket.get("unschedulable"):
+        extras.append(f"不可调度{bucket['unschedulable']}")
     return extras
+
+
+def is_plain_unschedulable(row: dict[str, Any]) -> bool:
+    return (
+        not bool(row.get("normal"))
+        and row.get("status") in ("active", "")
+        and not bool(row.get("schedulable"))
+        and not bool(row.get("rate_limited"))
+        and not bool(row.get("overloaded"))
+        and not bool(row.get("temp_unschedulable"))
+        and not bool(row.get("expired"))
+    )
 
 
 def format_quota_summary_lines(rows: list[dict[str, Any]]) -> list[str]:
@@ -1306,6 +1324,7 @@ def summarize_account_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
                     "overloaded": 0,
                     "temp": 0,
                     "expired": 0,
+                    "unschedulable": 0,
                     "rows": [],
                     "abnormal_rows": [],
                 },
@@ -1326,6 +1345,8 @@ def summarize_account_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
                 bucket["temp"] += 1
             if row.get("expired"):
                 bucket["expired"] += 1
+            if is_plain_unschedulable(row):
+                bucket["unschedulable"] += 1
     return sorted(buckets.values(), key=group_bucket_sort_key)
 
 
@@ -1357,6 +1378,8 @@ def format_group_summary_line(bucket: dict[str, Any]) -> str:
         extras.append(f"临停{bucket['temp']}")
     if bucket.get("expired"):
         extras.append(f"过期{bucket['expired']}")
+    if bucket.get("unschedulable"):
+        extras.append(f"不可调度{bucket['unschedulable']}")
     icon = summary_icon(normal, total, extras)
     line = f"{icon} {tg_code(group_bucket_label(bucket))} {normal}/{total}"
     return line + (f" · {h(' · '.join(extras))}" if extras else "")
@@ -1371,7 +1394,7 @@ def format_group_summary_block(bucket: dict[str, Any]) -> str:
         lines.append("  " + format_type_breakdown_line(key, type_bucket, html_mode=True))
         quota = format_quota_totals(quota_buckets.get(key, {}))
         if quota:
-            lines.append(f"    {h('额度')} {quota}")
+            lines.append(f"    {h('剩余额度')} {quota}")
     return "\n".join(lines)
 
 
