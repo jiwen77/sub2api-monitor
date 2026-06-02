@@ -449,18 +449,23 @@ class Monitor:
 
     def check_update_status(self) -> dict[str, Any]:
         local_version = current_install_version()
+        local_app_version = current_app_version()
         repo_url = os.environ.get("UPDATE_REPO_URL", DEFAULT_UPDATE_REPO_URL)
         ref = os.environ.get("UPDATE_REF", DEFAULT_UPDATE_REF)
         remote_version = ""
+        remote_app_version = ""
         error = ""
         try:
             remote_version = remote_git_version(repo_url, ref)
+            remote_app_version = remote_app_version_for_ref(repo_url, ref)
         except Exception as exc:
             error = truncate(str(exc), 300)
         has_update = bool(local_version and remote_version and local_version != remote_version)
         return {
             "local_version": local_version,
             "remote_version": remote_version,
+            "local_app_version": local_app_version,
+            "remote_app_version": remote_app_version,
             "repo_url": repo_url,
             "ref": ref,
             "has_update": has_update,
@@ -1900,8 +1905,8 @@ def build_update_reply_markup() -> dict[str, Any]:
 
 
 def build_update_status_message(status: dict[str, Any], tz: dt.tzinfo | None = None) -> str:
-    local_version = short_git_version(status.get("local_version"))
-    remote_version = short_git_version(status.get("remote_version"))
+    local_version = display_release_version(status.get("local_app_version"), status.get("local_version"))
+    remote_version = display_release_version(status.get("remote_app_version"), status.get("remote_version"))
     ref = str(status.get("ref") or DEFAULT_UPDATE_REF)
     lines = [
         "🔄 <b>Sub2API Monitor 更新检查</b>",
@@ -1930,7 +1935,10 @@ def build_update_triggered_message(status: dict[str, Any], log_path: str, tz: dt
     return "\n".join([
         "🚀 <b>已触发更新</b>",
         muted(now_iso(tz or Config().tzinfo())),
-        h(f"{short_git_version(status.get('local_version'))} → {short_git_version(status.get('remote_version'))}"),
+        h(
+            f"{display_release_version(status.get('local_app_version'), status.get('local_version'))} "
+            f"→ {display_release_version(status.get('remote_app_version'), status.get('remote_version'))}"
+        ),
         h(f"日志：{log_path}"),
         h("服务会由更新脚本自动重启。"),
     ])
@@ -1965,6 +1973,17 @@ def current_install_version() -> str:
     return "unknown"
 
 
+def current_app_version() -> str:
+    version_file = Path(__file__).resolve().parent / "VERSION"
+    try:
+        return normalize_app_version(version_file.read_text(encoding="utf-8").strip())
+    except FileNotFoundError:
+        return "unknown"
+    except Exception:
+        logging.exception("failed to read app version file: %s", version_file)
+        return "unknown"
+
+
 def remote_git_version(repo_url: str, ref: str) -> str:
     proc = subprocess.run(
         ["git", "ls-remote", repo_url, ref],
@@ -1986,6 +2005,45 @@ def remote_git_version(repo_url: str, ref: str) -> str:
     if first and re.fullmatch(r"[0-9a-f]{40}", first[0]):
         return first[0]
     raise RuntimeError(f"remote ref not found: {shlex.quote(ref)}")
+
+
+def remote_app_version_for_ref(repo_url: str, ref: str) -> str:
+    raw_base = remote_raw_base_url(repo_url, ref)
+    url = f"{raw_base}/VERSION"
+    with urllib.request.urlopen(url, timeout=15) as resp:
+        return normalize_app_version(resp.read().decode("utf-8", errors="replace").strip())
+
+
+def remote_raw_base_url(repo_url: str, ref: str) -> str:
+    text = repo_url.strip()
+    if text.endswith(".git"):
+        text = text[:-4]
+    if text.startswith("git@github.com:"):
+        path = text.removeprefix("git@github.com:")
+        return f"https://raw.githubusercontent.com/{path}/{urllib.parse.quote(ref, safe='')}"
+    if text.startswith("https://github.com/"):
+        path = text.removeprefix("https://github.com/")
+        return f"https://raw.githubusercontent.com/{path}/{urllib.parse.quote(ref, safe='')}"
+    raise RuntimeError(f"cannot derive raw VERSION URL from repo: {repo_url}")
+
+
+def normalize_app_version(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    match = re.search(r"\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?", text)
+    return match.group(0) if match else text[:40]
+
+
+def display_release_version(app_version: Any, git_version: Any) -> str:
+    app_text = normalize_app_version(app_version)
+    git_text = short_git_version(git_version)
+    if app_text and app_text != "unknown":
+        prefix = app_text if app_text.startswith("v") else f"v{app_text}"
+        if git_text and git_text != "unknown":
+            return f"{prefix} ({git_text})"
+        return prefix
+    return git_text
 
 
 def short_git_version(value: Any) -> str:

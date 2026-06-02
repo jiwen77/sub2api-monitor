@@ -172,7 +172,7 @@ Commands are accepted only from authorized chat IDs.
 | `/accounts` | Send the full account list with group labels |
 | `/groups` | Send a group-level health overview, then de-duplicated non-normal accounts |
 | `/daily` | Send the previous-day/current-day usage report |
-| `/update` | Check GitHub for a newer monitor version and show an inline update button when available |
+| `/update` | Check GitHub for a newer monitor version, show version + commit, and display an inline update button when available |
 | `/ping` | Check whether the daemon is receiving commands |
 | `/help` | Show command help |
 

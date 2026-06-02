@@ -359,6 +359,49 @@ class PredicateTests(unittest.TestCase):
         self.assertEqual(calls[0][1]["callback_query_id"], "cb-1")
         self.assertEqual(calls[0][1]["text"], "开始更新")
 
+    def test_update_status_message_shows_semantic_version_and_commit(self):
+        message = m.build_update_status_message(
+            {
+                "local_app_version": "0.2.0",
+                "remote_app_version": "0.2.1",
+                "local_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "remote_version": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "ref": "main",
+                "has_update": True,
+                "error": "",
+            },
+            dt.timezone.utc,
+        )
+
+        self.assertIn("当前版本：v0.2.0 (aaaaaaaa)", message)
+        self.assertIn("远端版本：v0.2.1 (bbbbbbbb)", message)
+
+    def test_update_triggered_message_shows_semantic_version_arrow(self):
+        message = m.build_update_triggered_message(
+            {
+                "local_app_version": "0.2.0",
+                "remote_app_version": "0.2.1",
+                "local_version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "remote_version": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            },
+            "/var/log/sub2api-monitor/update-from-telegram.log",
+            dt.timezone.utc,
+        )
+
+        self.assertIn("v0.2.0 (aaaaaaaa) → v0.2.1 (bbbbbbbb)", message)
+
+    def test_release_version_helpers(self):
+        self.assertEqual(
+            m.remote_raw_base_url("https://github.com/jiwen77/sub2api-monitor.git", "main"),
+            "https://raw.githubusercontent.com/jiwen77/sub2api-monitor/main",
+        )
+        self.assertEqual(
+            m.remote_raw_base_url("git@github.com:jiwen77/sub2api-monitor.git", "release/v1"),
+            "https://raw.githubusercontent.com/jiwen77/sub2api-monitor/release%2Fv1",
+        )
+        self.assertEqual(m.display_release_version("0.2.0", "a" * 40), "v0.2.0 (aaaaaaaa)")
+        self.assertEqual(m.display_release_version("", "b" * 40), "bbbbbbbb")
+
     def test_change_alert_can_hide_summary_and_abnormal_list(self):
         cfg = m.Config()
         changed = {
