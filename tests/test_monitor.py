@@ -512,6 +512,72 @@ class PredicateTests(unittest.TestCase):
         self.assertEqual(message.count("#101"), 1)
         self.assertIn("所属分组：default、vip", message)
 
+    def test_daily_message_keeps_yesterday_and_today_details_separate(self):
+        cfg = m.Config()
+        yesterday = {
+            "summary": {
+                "requests": 10,
+                "input_tokens": 1_000_000,
+                "output_tokens": 200_000,
+                "cache_tokens": 3_000_000,
+                "total_tokens": 4_200_000,
+                "total_cost": "12.345678",
+                "avg_duration_ms": "100.1",
+                "avg_first_token_ms": "20.2",
+            },
+            "by_plan": [
+                {"platform": "openai", "plan": "plus", "requests": 7, "total_tokens": 3_000_000},
+            ],
+            "top_models": [
+                {"model": "gpt-5.5", "requests": 7, "total_tokens": 3_000_000},
+            ],
+        }
+        today = {
+            "summary": {
+                "requests": 5,
+                "input_tokens": 500_000,
+                "output_tokens": 100_000,
+                "cache_tokens": 2_000_000,
+                "total_tokens": 2_600_000,
+                "total_cost": "8.000000",
+                "avg_duration_ms": "90.5",
+                "avg_first_token_ms": "18.0",
+            },
+            "by_plan": [
+                {"platform": "openai", "plan": "team", "requests": 5, "total_tokens": 2_600_000},
+            ],
+            "top_models": [
+                {"model": "gpt-5.4", "requests": 5, "total_tokens": 2_600_000},
+            ],
+        }
+
+        message = m.build_daily_message(
+            dt.date(2026, 6, 1),
+            yesterday,
+            dt.date(2026, 6, 2),
+            today,
+            cfg,
+            dt.datetime(2026, 6, 2, 12, 42, 56, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertIn("今日按账号类型", message)
+        self.assertIn("今日 Top 模型", message)
+        yesterday_summary = message.index("昨日 2026-06-01")
+        yesterday_by_plan = message.index("昨日按账号类型")
+        yesterday_top_models = message.index("昨日 Top 模型")
+        today_summary = message.index("今日 2026-06-02 截至当前")
+        today_by_plan = message.index("今日按账号类型")
+        today_top_models = message.index("今日 Top 模型")
+        self.assertLess(yesterday_summary, yesterday_by_plan)
+        self.assertLess(yesterday_by_plan, yesterday_top_models)
+        self.assertLess(yesterday_top_models, today_summary)
+        self.assertLess(today_summary, today_by_plan)
+        self.assertLess(today_by_plan, today_top_models)
+        self.assertIn("Input <code>500.00K</code> · Output <code>100.00K</code> · Cache <code>2.00M</code>", message)
+        self.assertIn("Avg <code>90.5 ms</code> · First token <code>18.0 ms</code>", message)
+        self.assertIn("<code>openai/team</code> 2.60M tokens · 5 req", message)
+        self.assertIn("<code>gpt-5.4</code> 2.60M tokens · 5 req", message)
+
 
 if __name__ == "__main__":
     unittest.main()

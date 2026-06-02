@@ -1552,35 +1552,39 @@ def build_proxy_error_message(grouped: dict[str, dict[str, Any]], suppressed: in
 
 
 def build_daily_message(day: dt.date, yesterday: dict[str, Any], today_date: dt.date, today: dict[str, Any], cfg: Config, now: dt.datetime) -> str:
-    ys = yesterday.get("summary") or {}
-    ts = today.get("summary") or {}
     lines = [
         "📊 <b>Sub2API 每日用量</b>",
         muted(now.strftime('%Y-%m-%d %H:%M:%S %Z')),
         "",
-        section(f"昨日 {day.isoformat()}"),
-        f"Tokens {tg_code(fmt_compact_int(ys.get('total_tokens')))} · Requests {tg_code(fmt_int(ys.get('requests')))} · Cost {tg_code(fmt_money(ys.get('total_cost')))}",
-        f"Input {tg_code(fmt_compact_int(ys.get('input_tokens')))} · Output {tg_code(fmt_compact_int(ys.get('output_tokens')))} · Cache {tg_code(fmt_compact_int(ys.get('cache_tokens')))}",
-        f"Avg {tg_code(str(ys.get('avg_duration_ms', 0)) + ' ms')} · First token {tg_code(str(ys.get('avg_first_token_ms', 0)) + ' ms')}",
-        "",
-        section(f"今日 {today_date.isoformat()} 截至当前"),
-        f"Tokens {tg_code(fmt_compact_int(ts.get('total_tokens')))} · Requests {tg_code(fmt_int(ts.get('requests')))} · Cost {tg_code(fmt_money(ts.get('total_cost')))}",
     ]
-    if yesterday.get("by_plan"):
-        lines += ["", section("昨日按账号类型")]
-        for row in yesterday["by_plan"][: cfg.detail_limit]:
+    lines += daily_usage_section(f"昨日 {day.isoformat()}", "昨日", yesterday, cfg)
+    lines += [""] + daily_usage_section(f"今日 {today_date.isoformat()} 截至当前", "今日", today, cfg)
+    return clamp_message("\n".join(lines))
+
+
+def daily_usage_section(title: str, label: str, stats: dict[str, Any], cfg: Config) -> list[str]:
+    summary = stats.get("summary") or {}
+    lines = [
+        section(title),
+        f"Tokens {tg_code(fmt_compact_int(summary.get('total_tokens')))} · Requests {tg_code(fmt_int(summary.get('requests')))} · Cost {tg_code(fmt_money(summary.get('total_cost')))}",
+        f"Input {tg_code(fmt_compact_int(summary.get('input_tokens')))} · Output {tg_code(fmt_compact_int(summary.get('output_tokens')))} · Cache {tg_code(fmt_compact_int(summary.get('cache_tokens')))}",
+        f"Avg {tg_code(str(summary.get('avg_duration_ms', 0)) + ' ms')} · First token {tg_code(str(summary.get('avg_first_token_ms', 0)) + ' ms')}",
+    ]
+    if stats.get("by_plan"):
+        lines += ["", section(f"{label}按账号类型")]
+        for row in stats["by_plan"][: cfg.detail_limit]:
             lines.append(
                 f"• {tg_code(str(row.get('platform') or 'unknown') + '/' + str(row.get('plan') or 'unknown'))} "
                 f"{h(fmt_compact_int(row.get('total_tokens')) + ' tokens')} · {h(fmt_int(row.get('requests')) + ' req')}"
             )
-    if yesterday.get("top_models"):
-        lines += ["", section("昨日 Top 模型")]
-        for row in yesterday["top_models"][: min(8, cfg.detail_limit)]:
+    if stats.get("top_models"):
+        lines += ["", section(f"{label} Top 模型")]
+        for row in stats["top_models"][: min(8, cfg.detail_limit)]:
             lines.append(
                 f"• {tg_code(str(row.get('model') or 'unknown'))} "
                 f"{h(fmt_compact_int(row.get('total_tokens')) + ' tokens')} · {h(fmt_int(row.get('requests')) + ' req')}"
             )
-    return clamp_message("\n".join(lines))
+    return lines
 
 
 def build_simple_alert(title: str, detail: str, cfg: Config) -> str:
