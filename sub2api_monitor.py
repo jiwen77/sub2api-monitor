@@ -1687,8 +1687,8 @@ def build_daily_message(day: dt.date, yesterday: dict[str, Any], today_date: dt.
         muted(now.strftime('%Y-%m-%d %H:%M:%S %Z')),
         "",
     ]
-    lines += daily_usage_section(f"昨日 {day.isoformat()}", yesterday, cfg)
-    lines += ["", "────────────", ""] + daily_usage_section(f"今日 {today_date.isoformat()} 截至当前", today, cfg)
+    lines += daily_usage_section(f"🌙 昨日 {day.isoformat()}", yesterday, cfg)
+    lines += ["━━━━━━━━━━━━"] + daily_usage_section(f"☀️ 今日 {today_date.isoformat()} 截至当前", today, cfg)
     return clamp_message("\n".join(lines))
 
 
@@ -1696,23 +1696,23 @@ def daily_usage_section(title: str, stats: dict[str, Any], cfg: Config) -> list[
     summary = stats.get("summary") or {}
     lines = [
         section(title),
-        f"Tokens {tg_code(fmt_compact_int(summary.get('total_tokens')))} · Requests {tg_code(fmt_int(summary.get('requests')))} · Cost {tg_code(fmt_money(summary.get('total_cost')))}",
-        f"Input {tg_code(fmt_compact_int(summary.get('input_tokens')))} · Output {tg_code(fmt_compact_int(summary.get('output_tokens')))} · Cache {tg_code(fmt_compact_int(summary.get('cache_tokens')))}",
-        f"Avg {tg_code(str(summary.get('avg_duration_ms', 0)) + ' ms')} · First token {tg_code(str(summary.get('avg_first_token_ms', 0)) + ' ms')}",
+        f"用量 {tg_code(fmt_compact_int(summary.get('total_tokens')))} · 请求 {tg_code(fmt_int(summary.get('requests')))} · 成本 {tg_code(fmt_money(summary.get('total_cost')))}",
+        f"输入/输出/缓存 {tg_code(fmt_compact_int(summary.get('input_tokens')))} / {tg_code(fmt_compact_int(summary.get('output_tokens')))} / {tg_code(fmt_compact_int(summary.get('cache_tokens')))}",
+        f"平均 {tg_code(str(summary.get('avg_duration_ms', 0)) + 'ms')} · 首Token {tg_code(str(summary.get('avg_first_token_ms', 0)) + 'ms')}",
     ]
     if stats.get("by_plan"):
-        lines += ["", section("按账号类型")]
+        lines += [section("👥 按账号类型")]
         for row in stats["by_plan"][: cfg.detail_limit]:
             lines.append(
-                f"• {tg_code(str(row.get('platform') or 'unknown') + '/' + str(row.get('plan') or 'unknown'))} "
-                f"{h(fmt_compact_int(row.get('total_tokens')) + ' tokens')} · {h(fmt_int(row.get('requests')) + ' req')}"
+                f"  • {tg_code(str(row.get('platform') or 'unknown') + '/' + str(row.get('plan') or 'unknown'))} "
+                f"{h(fmt_compact_int(row.get('total_tokens')))} · {h(fmt_int(row.get('requests')) + ' req')}"
             )
     if stats.get("top_models"):
-        lines += ["", section("Top 模型")]
+        lines += [section("🤖 Top 模型")]
         for row in stats["top_models"][: min(8, cfg.detail_limit)]:
             lines.append(
-                f"• {tg_code(str(row.get('model') or 'unknown'))} "
-                f"{h(fmt_compact_int(row.get('total_tokens')) + ' tokens')} · {h(fmt_int(row.get('requests')) + ' req')}"
+                f"  • {tg_code(str(row.get('model') or 'unknown'))} "
+                f"{h(fmt_compact_int(row.get('total_tokens')))} · {h(fmt_int(row.get('requests')) + ' req')}"
             )
     return lines
 
