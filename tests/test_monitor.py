@@ -300,7 +300,7 @@ class PredicateTests(unittest.TestCase):
         original = m.telegram_api_request
         reply_markup = {
             "inline_keyboard": [
-                [{"text": "立即更新", "callback_data": "sub2api:update:run"}],
+                [{"text": "🔄 立即更新", "callback_data": "sub2api:update:run"}],
             ]
         }
 
@@ -323,6 +323,10 @@ class PredicateTests(unittest.TestCase):
         method, payload, _timeout_seconds = calls[0]
         self.assertEqual(method, "sendMessage")
         self.assertEqual(m.json.loads(payload["reply_markup"]), reply_markup)
+
+    def test_update_button_label_has_update_icon(self):
+        reply_markup = m.build_update_reply_markup()
+        self.assertEqual(reply_markup["inline_keyboard"][0][0]["text"], "🔄 立即更新")
 
     def test_telegram_get_updates_accepts_callback_queries(self):
         calls = []
@@ -401,6 +405,41 @@ class PredicateTests(unittest.TestCase):
         )
         self.assertEqual(m.display_release_version("0.2.0", "a" * 40), "v0.2.0 (aaaaaaaa)")
         self.assertEqual(m.display_release_version("", "b" * 40), "bbbbbbbb")
+        self.assertEqual(
+            m.remote_raw_base_url("https://github.com/jiwen77/sub2api-monitor.git", "6b23b66a706c49f67a41965075d6f809b4da1f0a"),
+            "https://raw.githubusercontent.com/jiwen77/sub2api-monitor/6b23b66a706c49f67a41965075d6f809b4da1f0a",
+        )
+
+    def test_update_status_reads_remote_app_version_at_remote_commit(self):
+        class FakeMonitor(m.Monitor):
+            def __init__(self, cfg):
+                super().__init__(cfg, dry_run=True)
+
+        original_current_install = m.current_install_version
+        original_current_app = m.current_app_version
+        original_remote_git = m.remote_git_version
+        original_remote_app = m.remote_app_version_for_ref
+        remote_app_calls = []
+
+        try:
+            m.current_install_version = lambda: "a" * 40
+            m.current_app_version = lambda: "0.2.0"
+            m.remote_git_version = lambda repo_url, ref: "b" * 40
+
+            def fake_remote_app(repo_url, ref):
+                remote_app_calls.append((repo_url, ref))
+                return "0.2.1"
+
+            m.remote_app_version_for_ref = fake_remote_app
+            status = FakeMonitor(m.Config()).check_update_status()
+        finally:
+            m.current_install_version = original_current_install
+            m.current_app_version = original_current_app
+            m.remote_git_version = original_remote_git
+            m.remote_app_version_for_ref = original_remote_app
+
+        self.assertEqual(status["remote_app_version"], "0.2.1")
+        self.assertEqual(remote_app_calls[0][1], "b" * 40)
 
     def test_change_alert_can_hide_summary_and_abnormal_list(self):
         cfg = m.Config()
@@ -668,17 +707,22 @@ class PredicateTests(unittest.TestCase):
             dt.datetime(2026, 6, 2, 12, 42, 56, tzinfo=dt.timezone.utc),
         )
 
-        self.assertIn("今日按账号类型", message)
-        self.assertIn("今日 Top 模型", message)
+        self.assertIn("\n────────────\n", message)
+        self.assertNotIn("昨日按账号类型", message)
+        self.assertNotIn("今日按账号类型", message)
+        self.assertEqual(message.count("按账号类型"), 2)
+        self.assertEqual(message.count("Top 模型"), 2)
         yesterday_summary = message.index("昨日 2026-06-01")
-        yesterday_by_plan = message.index("昨日按账号类型")
-        yesterday_top_models = message.index("昨日 Top 模型")
+        yesterday_by_plan = message.index("按账号类型")
+        yesterday_top_models = message.index("Top 模型")
         today_summary = message.index("今日 2026-06-02 截至当前")
-        today_by_plan = message.index("今日按账号类型")
-        today_top_models = message.index("今日 Top 模型")
+        divider = message.index("────────────")
+        today_by_plan = message.index("按账号类型", today_summary)
+        today_top_models = message.index("Top 模型", today_summary)
         self.assertLess(yesterday_summary, yesterday_by_plan)
         self.assertLess(yesterday_by_plan, yesterday_top_models)
-        self.assertLess(yesterday_top_models, today_summary)
+        self.assertLess(yesterday_top_models, divider)
+        self.assertLess(divider, today_summary)
         self.assertLess(today_summary, today_by_plan)
         self.assertLess(today_by_plan, today_top_models)
         self.assertIn("Input <code>500.00K</code> · Output <code>100.00K</code> · Cache <code>2.00M</code>", message)
@@ -816,7 +860,7 @@ class TelegramCommandTests(unittest.TestCase):
         self.assertIn("发现新版本", text)
         self.assertIn("aaaaaaaa", text)
         self.assertIn("bbbbbbbb", text)
-        self.assertEqual(reply_markup["inline_keyboard"][0][0]["text"], "立即更新")
+        self.assertEqual(reply_markup["inline_keyboard"][0][0]["text"], "🔄 立即更新")
         self.assertEqual(reply_markup["inline_keyboard"][0][0]["callback_data"], "sub2api:update:run")
 
     def test_update_callback_rechecks_then_triggers_update(self):

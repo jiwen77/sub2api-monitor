@@ -457,7 +457,7 @@ class Monitor:
         error = ""
         try:
             remote_version = remote_git_version(repo_url, ref)
-            remote_app_version = remote_app_version_for_ref(repo_url, ref)
+            remote_app_version = remote_app_version_for_ref(repo_url, remote_version)
         except Exception as exc:
             error = truncate(str(exc), 300)
         has_update = bool(local_version and remote_version and local_version != remote_version)
@@ -1687,12 +1687,12 @@ def build_daily_message(day: dt.date, yesterday: dict[str, Any], today_date: dt.
         muted(now.strftime('%Y-%m-%d %H:%M:%S %Z')),
         "",
     ]
-    lines += daily_usage_section(f"昨日 {day.isoformat()}", "昨日", yesterday, cfg)
-    lines += [""] + daily_usage_section(f"今日 {today_date.isoformat()} 截至当前", "今日", today, cfg)
+    lines += daily_usage_section(f"昨日 {day.isoformat()}", yesterday, cfg)
+    lines += ["", "────────────", ""] + daily_usage_section(f"今日 {today_date.isoformat()} 截至当前", today, cfg)
     return clamp_message("\n".join(lines))
 
 
-def daily_usage_section(title: str, label: str, stats: dict[str, Any], cfg: Config) -> list[str]:
+def daily_usage_section(title: str, stats: dict[str, Any], cfg: Config) -> list[str]:
     summary = stats.get("summary") or {}
     lines = [
         section(title),
@@ -1701,14 +1701,14 @@ def daily_usage_section(title: str, label: str, stats: dict[str, Any], cfg: Conf
         f"Avg {tg_code(str(summary.get('avg_duration_ms', 0)) + ' ms')} · First token {tg_code(str(summary.get('avg_first_token_ms', 0)) + ' ms')}",
     ]
     if stats.get("by_plan"):
-        lines += ["", section(f"{label}按账号类型")]
+        lines += ["", section("按账号类型")]
         for row in stats["by_plan"][: cfg.detail_limit]:
             lines.append(
                 f"• {tg_code(str(row.get('platform') or 'unknown') + '/' + str(row.get('plan') or 'unknown'))} "
                 f"{h(fmt_compact_int(row.get('total_tokens')) + ' tokens')} · {h(fmt_int(row.get('requests')) + ' req')}"
             )
     if stats.get("top_models"):
-        lines += ["", section(f"{label} Top 模型")]
+        lines += ["", section("Top 模型")]
         for row in stats["top_models"][: min(8, cfg.detail_limit)]:
             lines.append(
                 f"• {tg_code(str(row.get('model') or 'unknown'))} "
@@ -1899,7 +1899,7 @@ def build_command_help() -> str:
 def build_update_reply_markup() -> dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": "立即更新", "callback_data": UPDATE_CALLBACK_DATA}],
+            [{"text": "🔄 立即更新", "callback_data": UPDATE_CALLBACK_DATA}],
         ]
     }
 
