@@ -194,6 +194,7 @@ class Monitor:
     cfg: Config
     dry_run: bool = False
     state: dict[str, Any] = field(default_factory=dict)
+    _table_columns_cache: dict[str, set[str]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.state = load_state(Path(self.cfg.state_file))
@@ -522,6 +523,27 @@ class Monitor:
             return None
         return json.loads(text)
 
+    def table_columns(self, table_name: str) -> set[str]:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
+            return set()
+        if table_name not in self._table_columns_cache:
+            sql = f"""
+SELECT coalesce(json_agg(column_name ORDER BY ordinal_position), '[]'::json)::text
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = {sql_literal(table_name)};
+"""
+            try:
+                self._table_columns_cache[table_name] = set(self.query_json(sql) or [])
+            except Exception:
+                logging.exception("failed to inspect table columns for %s", table_name)
+                raise
+        return self._table_columns_cache[table_name]
+
+    def table_has_columns(self, table_name: str, required_columns: Iterable[str]) -> bool:
+        columns = self.table_columns(table_name)
+        return bool(columns) and set(required_columns).issubset(columns)
+
     def psql(self, sql: str) -> str:
         env_arg = f"PGPASSWORD={self.cfg.postgres_password}"
         cmd = [
@@ -666,25 +688,314 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
         )
 
     def current_user_recharge_rows(self) -> list[dict[str, Any]]:
-        sql = """
+        user_columns = self.table_columns("users")
+        if "id" not in user_columns:
+            return []
+        email_expr = "coalesce(email, '')" if "email" in user_columns else "''"
+        username_expr = "coalesce(username, '')" if "username" in user_columns else "''"
+        role_expr = "coalesce(role, '')" if "role" in user_columns else "''"
+        status_expr = "coalesce(status, '')" if "status" in user_columns else "''"
+        balance_expr = "coalesce(balance, 0)::numeric(30,8)::text" if "balance" in user_columns else "'0'"
+        total_expr = "coalesce(total_recharged, 0)::numeric(30,8)::text" if "total_recharged" in user_columns else "'0'"
+        created_expr = "created_at" if "created_at" in user_columns else "NULL::timestamptz AS created_at"
+        updated_expr = "updated_at" if "updated_at" in user_columns else "NULL::timestamptz AS updated_at"
+        where_clause = "WHERE deleted_at IS NULL" if "deleted_at" in user_columns else ""
+        sql = f"""
 WITH rows AS (
   SELECT
     id,
-    coalesce(email, '') AS email,
-    coalesce(username, '') AS username,
-    coalesce(role, '') AS role,
-    coalesce(status, '') AS status,
-    coalesce(balance, 0)::numeric(30,8)::text AS balance,
-    coalesce(total_recharged, 0)::numeric(30,8)::text AS total_recharged,
-    created_at,
-    updated_at
+    {email_expr} AS email,
+    {username_expr} AS username,
+    {role_expr} AS role,
+    {status_expr} AS status,
+    {balance_expr} AS balance,
+    {total_expr} AS total_recharged,
+    {created_expr},
+    {updated_expr}
   FROM users
-  WHERE deleted_at IS NULL
+  {where_clause}
   ORDER BY id
 )
 SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
 """
         return self.query_json(sql) or []
+
+    def max_redeem_event_cursor(self) -> dict[str, Any]:
+        if not self.table_has_columns("redeem_codes", {"id", "status", "used_by", "created_at"}):
+            return {"at": "", "id": 0}
+        event_expr = "coalesce(used_at, created_at)" if "used_at" in self.table_columns("redeem_codes") else "created_at"
+        sql = f"""
+SELECT coalesce((
+  SELECT json_build_object('at', event_at::text, 'id', id)::text
+  FROM (
+    SELECT id, {event_expr} AS event_at
+    FROM redeem_codes
+    WHERE status = 'used'
+      AND used_by IS NOT NULL
+  ) s
+  ORDER BY event_at DESC, id DESC
+  LIMIT 1
+), json_build_object('at', now()::text, 'id', 0)::text);
+"""
+        return self.query_json(sql) or {"at": "", "id": 0}
+
+    def fetch_redeem_events_after(self, at: str, record_id: int, limit: int = 500) -> list[dict[str, Any]]:
+        redeem_columns = self.table_columns("redeem_codes")
+        if not {"id", "status", "used_by", "created_at", "type", "value"}.issubset(redeem_columns):
+            return []
+        user_columns = self.table_columns("users")
+        group_columns = self.table_columns("groups")
+        event_expr = "coalesce(rc.used_at, rc.created_at)" if "used_at" in redeem_columns else "rc.created_at"
+        used_at_expr = "rc.used_at" if "used_at" in redeem_columns else "NULL::timestamptz AS used_at"
+        notes_expr = "coalesce(rc.notes, '')" if "notes" in redeem_columns else "''"
+        group_id_expr = "rc.group_id" if "group_id" in redeem_columns else "NULL::bigint"
+        validity_days_expr = "rc.validity_days" if "validity_days" in redeem_columns else "NULL::integer"
+        group_join = ""
+        group_name_expr = "''"
+        if "group_id" in redeem_columns and {"id", "name"}.issubset(group_columns):
+            group_join = "LEFT JOIN groups g ON g.id = rc.group_id"
+            group_name_expr = "coalesce(g.name, '')"
+        user_select = self.user_event_select_expressions("u", user_columns)
+        cursor_clause = ""
+        if at:
+            cursor_clause = f"AND ({event_expr}, rc.id) > ({sql_literal(at)}::timestamptz, {int(record_id)})"
+        sql = f"""
+WITH rows AS (
+  SELECT
+    'redeem_code' AS source,
+    ('redeem:' || rc.id::text) AS event_key,
+    rc.id AS record_id,
+    {event_expr}::text AS event_at,
+    rc.id AS redeem_code_id,
+    coalesce(rc.type, '') AS type,
+    coalesce(rc.value, 0)::numeric(30,8)::text AS value,
+    coalesce(rc.status, '') AS event_status,
+    rc.used_by AS user_id,
+    {used_at_expr},
+    rc.created_at,
+    {notes_expr} AS notes,
+    {group_id_expr} AS group_id,
+    {validity_days_expr} AS validity_days,
+    {group_name_expr} AS group_name,
+    {user_select}
+  FROM redeem_codes rc
+  LEFT JOIN users u ON u.id = rc.used_by
+  {group_join}
+  WHERE rc.status = 'used'
+    AND rc.used_by IS NOT NULL
+    {cursor_clause}
+  ORDER BY {event_expr} ASC, rc.id ASC
+  LIMIT {int(limit)}
+)
+SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
+"""
+        return self.query_json(sql) or []
+
+    def max_payment_subscription_cursor(self) -> dict[str, Any]:
+        payment_columns = self.table_columns("payment_orders")
+        if not {"id", "status", "order_type", "created_at"}.issubset(payment_columns):
+            return {"at": "", "id": 0}
+        event_expr = self.payment_event_expression(payment_columns, "po")
+        sql = f"""
+SELECT coalesce((
+  SELECT json_build_object('at', event_at::text, 'id', id)::text
+  FROM (
+    SELECT po.id, {event_expr} AS event_at
+    FROM payment_orders po
+    WHERE po.status = 'COMPLETED'
+      AND po.order_type = 'subscription'
+  ) s
+  ORDER BY event_at DESC, id DESC
+  LIMIT 1
+), json_build_object('at', now()::text, 'id', 0)::text);
+"""
+        return self.query_json(sql) or {"at": "", "id": 0}
+
+    def fetch_payment_subscription_events_after(self, at: str, record_id: int, limit: int = 500) -> list[dict[str, Any]]:
+        payment_columns = self.table_columns("payment_orders")
+        if not {"id", "user_id", "status", "order_type", "created_at", "amount", "pay_amount", "payment_type"}.issubset(payment_columns):
+            return []
+        user_columns = self.table_columns("users")
+        group_columns = self.table_columns("groups")
+        event_expr = self.payment_event_expression(payment_columns, "po")
+        completed_at_expr = "po.completed_at" if "completed_at" in payment_columns else "NULL::timestamptz AS completed_at"
+        paid_at_expr = "po.paid_at" if "paid_at" in payment_columns else "NULL::timestamptz AS paid_at"
+        out_trade_no_expr = "coalesce(po.out_trade_no, '')" if "out_trade_no" in payment_columns else "''"
+        group_id_expr = "po.subscription_group_id" if "subscription_group_id" in payment_columns else "NULL::bigint"
+        days_expr = "po.subscription_days" if "subscription_days" in payment_columns else "NULL::integer"
+        group_join = ""
+        group_name_expr = "''"
+        if "subscription_group_id" in payment_columns and {"id", "name"}.issubset(group_columns):
+            group_join = "LEFT JOIN groups g ON g.id = po.subscription_group_id"
+            group_name_expr = "coalesce(g.name, '')"
+        user_select = self.user_event_select_expressions("u", user_columns)
+        cursor_clause = ""
+        if at:
+            cursor_clause = f"AND ({event_expr}, po.id) > ({sql_literal(at)}::timestamptz, {int(record_id)})"
+        sql = f"""
+WITH rows AS (
+  SELECT
+    'payment_order' AS source,
+    ('payment:' || po.id::text) AS event_key,
+    po.id AS record_id,
+    {event_expr}::text AS event_at,
+    po.id AS payment_order_id,
+    po.user_id AS user_id,
+    coalesce(po.order_type, '') AS type,
+    coalesce(po.status, '') AS event_status,
+    coalesce(po.amount, 0)::numeric(30,8)::text AS value,
+    coalesce(po.pay_amount, 0)::numeric(30,8)::text AS pay_amount,
+    coalesce(po.payment_type, '') AS payment_type,
+    {out_trade_no_expr} AS out_trade_no,
+    {group_id_expr} AS group_id,
+    {days_expr} AS subscription_days,
+    {group_name_expr} AS group_name,
+    {completed_at_expr},
+    {paid_at_expr},
+    po.created_at,
+    {user_select}
+  FROM payment_orders po
+  LEFT JOIN users u ON u.id = po.user_id
+  {group_join}
+  WHERE po.status = 'COMPLETED'
+    AND po.order_type = 'subscription'
+    {cursor_clause}
+  ORDER BY {event_expr} ASC, po.id ASC
+  LIMIT {int(limit)}
+)
+SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
+"""
+        return self.query_json(sql) or []
+
+    def max_affiliate_transfer_cursor(self) -> dict[str, Any]:
+        affiliate_columns = self.table_columns("user_affiliate_ledger")
+        if not {"id", "user_id", "action", "amount", "created_at"}.issubset(affiliate_columns):
+            return {"at": "", "id": 0}
+        sql = """
+SELECT coalesce((
+  SELECT json_build_object('at', created_at::text, 'id', id)::text
+  FROM user_affiliate_ledger
+  WHERE action = 'transfer'
+  ORDER BY created_at DESC, id DESC
+  LIMIT 1
+), json_build_object('at', now()::text, 'id', 0)::text);
+"""
+        return self.query_json(sql) or {"at": "", "id": 0}
+
+    def fetch_affiliate_transfer_events_after(self, at: str, record_id: int, limit: int = 500) -> list[dict[str, Any]]:
+        affiliate_columns = self.table_columns("user_affiliate_ledger")
+        if not {"id", "user_id", "action", "amount", "created_at"}.issubset(affiliate_columns):
+            return []
+        user_columns = self.table_columns("users")
+        balance_after_expr = "coalesce(al.balance_after, 0)::numeric(30,8)::text" if "balance_after" in affiliate_columns else "NULL::text"
+        source_order_expr = "al.source_order_id" if "source_order_id" in affiliate_columns else "NULL::bigint"
+        user_select = self.user_event_select_expressions("u", user_columns)
+        cursor_clause = ""
+        if at:
+            cursor_clause = f"AND (al.created_at, al.id) > ({sql_literal(at)}::timestamptz, {int(record_id)})"
+        sql = f"""
+WITH rows AS (
+  SELECT
+    'affiliate_transfer' AS source,
+    ('affiliate:' || al.id::text) AS event_key,
+    al.id AS record_id,
+    al.created_at::text AS event_at,
+    al.id AS affiliate_ledger_id,
+    al.user_id AS user_id,
+    'affiliate_balance' AS type,
+    'used' AS event_status,
+    coalesce(al.amount, 0)::numeric(30,8)::text AS value,
+    {balance_after_expr} AS balance_after,
+    {source_order_expr} AS source_order_id,
+    al.created_at,
+    {user_select}
+  FROM user_affiliate_ledger al
+  LEFT JOIN users u ON u.id = al.user_id
+  WHERE al.action = 'transfer'
+    {cursor_clause}
+  ORDER BY al.created_at ASC, al.id ASC
+  LIMIT {int(limit)}
+)
+SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
+"""
+        return self.query_json(sql) or []
+
+    def user_event_select_expressions(self, alias: str, columns: set[str]) -> str:
+        def expr(column: str, default: str = "''") -> str:
+            return f"coalesce({alias}.{column}, '')" if column in columns else default
+
+        balance_expr = f"coalesce({alias}.balance, 0)::numeric(30,8)::text" if "balance" in columns else "'0'"
+        total_expr = f"coalesce({alias}.total_recharged, 0)::numeric(30,8)::text" if "total_recharged" in columns else "'0'"
+        deleted_expr = f"{alias}.deleted_at" if "deleted_at" in columns else "NULL::timestamptz"
+        return "\n    ".join(
+            [
+                f"{expr('email')} AS email,",
+                f"{expr('username')} AS username,",
+                f"{expr('role')} AS role,",
+                f"{expr('status')} AS status,",
+                f"{balance_expr} AS balance,",
+                f"{total_expr} AS total_recharged,",
+                f"{deleted_expr} AS user_deleted_at",
+            ]
+        )
+
+    def payment_event_expression(self, payment_columns: set[str], alias: str) -> str:
+        parts = [
+            f"{alias}.{column}"
+            for column in ("completed_at", "paid_at", "updated_at", "created_at")
+            if column in payment_columns
+        ]
+        if not parts:
+            return "now()"
+        if len(parts) == 1:
+            return parts[0]
+        return "coalesce(" + ", ".join(parts) + ")"
+
+    def baseline_recharge_event_cursors(self) -> None:
+        self.set_recharge_event_cursor("redeem_code", self.max_redeem_event_cursor())
+        self.set_recharge_event_cursor("payment_order", self.max_payment_subscription_cursor())
+        self.set_recharge_event_cursor("affiliate_transfer", self.max_affiliate_transfer_cursor())
+        self.state["recharge_events_initialized"] = True
+
+    def fetch_new_recharge_events(self) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for source, fetcher in (
+            ("redeem_code", self.fetch_redeem_events_after),
+            ("payment_order", self.fetch_payment_subscription_events_after),
+            ("affiliate_transfer", self.fetch_affiliate_transfer_events_after),
+        ):
+            at, record_id = self.recharge_event_cursor(source)
+            if not at and int(record_id or 0) <= 0:
+                self.set_recharge_event_cursor(source, self.max_recharge_cursor_for_source(source))
+                continue
+            rows = fetcher(at, int(record_id or 0))
+            if rows:
+                events.extend(rows)
+                self.set_recharge_event_cursor(source, recharge_event_cursor_from_rows(rows))
+        events.sort(key=recharge_event_sort_key)
+        return events
+
+    def max_recharge_cursor_for_source(self, source: str) -> dict[str, Any]:
+        if source == "redeem_code":
+            return self.max_redeem_event_cursor()
+        if source == "payment_order":
+            return self.max_payment_subscription_cursor()
+        if source == "affiliate_transfer":
+            return self.max_affiliate_transfer_cursor()
+        return {"at": "", "id": 0}
+
+    def recharge_event_cursor(self, source: str) -> tuple[str, int]:
+        return (
+            str(self.state.get(f"last_{source}_event_at") or ""),
+            int(self.state.get(f"last_{source}_event_id") or 0),
+        )
+
+    def set_recharge_event_cursor(self, source: str, cursor: dict[str, Any]) -> None:
+        self.state[f"last_{source}_event_at"] = str(cursor.get("at") or "")
+        try:
+            self.state[f"last_{source}_event_id"] = int(cursor.get("id") or 0)
+        except Exception:
+            self.state[f"last_{source}_event_id"] = 0
 
     def check_user_recharges(self) -> str | None:
         if not self.cfg.user_recharge_alerts_enabled:
@@ -697,6 +1008,15 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
         self.state["user_recharges"] = current
         self.state["user_recharges_updated_at"] = now
         self.state["user_recharges_initialized"] = True
+
+        event_rows: list[dict[str, Any]] = []
+        try:
+            if not self.state.get("recharge_events_initialized"):
+                self.baseline_recharge_event_cursors()
+            else:
+                event_rows = self.fetch_new_recharge_events()
+        except Exception:
+            logging.exception("recharge event record check failed; falling back to users.total_recharged")
 
         if not initialized:
             return None
@@ -713,10 +1033,18 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
             row["_recharge_delta"] = decimal_string(current_total - previous_total)
             recharges.append(row)
 
-        if not recharges:
+        covered_user_ids = users_covered_by_balance_events(event_rows)
+        fallback_events = [
+            user_recharge_row_to_event(row)
+            for row in recharges
+            if str(row.get("id")) not in covered_user_ids
+        ]
+        events = event_rows + fallback_events
+
+        if not events:
             return None
-        recharges.sort(key=lambda r: decimal_value(r.get("_recharge_delta")), reverse=True)
-        return build_user_recharge_message(recharges, self.cfg)
+        events.sort(key=recharge_event_sort_key)
+        return build_recharge_event_message(events, self.cfg)
 
     def max_ops_error_id(self) -> int:
         sql = "SELECT coalesce(max(id),0)::bigint FROM ops_error_logs;"
@@ -994,6 +1322,63 @@ def user_recharge_digest(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def recharge_event_cursor_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return {"at": "", "id": 0}
+    latest = max(rows, key=recharge_event_sort_key)
+    return {"at": str(latest.get("event_at") or ""), "id": int(latest.get("record_id") or 0)}
+
+
+def recharge_event_sort_key(row: dict[str, Any]) -> tuple[str, int, str]:
+    try:
+        record_id = int(row.get("record_id") or 0)
+    except Exception:
+        record_id = 0
+    return (str(row.get("event_at") or ""), record_id, str(row.get("event_key") or ""))
+
+
+def user_recharge_row_to_event(row: dict[str, Any]) -> dict[str, Any]:
+    event = dict(row)
+    event["source"] = "user_total_recharged"
+    event["event_key"] = f"user_total:{row.get('id')}"
+    event["record_id"] = row.get("id") or 0
+    event["event_at"] = row.get("updated_at") or row.get("created_at") or ""
+    event["user_id"] = row.get("id")
+    event["type"] = "balance"
+    event["value"] = decimal_string(row.get("_recharge_delta"))
+    event["event_status"] = "used"
+    event["notes"] = "users.total_recharged fallback"
+    return event
+
+
+def users_covered_by_balance_events(events: list[dict[str, Any]]) -> set[str]:
+    covered: set[str] = set()
+    for row in events:
+        if recharge_event_balance_delta(row) > 0:
+            uid = row.get("user_id")
+            if uid not in (None, ""):
+                covered.add(str(uid))
+    return covered
+
+
+def recharge_event_balance_delta(row: dict[str, Any]) -> Decimal:
+    source = str(row.get("source") or "")
+    code_type = str(row.get("type") or "")
+    if source == "user_total_recharged":
+        return decimal_value(row.get("value") or row.get("_recharge_delta"))
+    if source == "redeem_code" and code_type in {"balance", "admin_balance"}:
+        return decimal_value(row.get("value"))
+    if source == "affiliate_transfer":
+        return decimal_value(row.get("value"))
+    return Decimal("0")
+
+
+def fmt_signed_amount(value: Any) -> str:
+    value_dec = decimal_value(value)
+    prefix = "+" if value_dec > 0 else ""
+    return prefix + fmt_amount(value_dec)
+
+
 def rows_by_id(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {str(r.get("id")): r for r in rows}
 
@@ -1152,6 +1537,139 @@ def build_groups_message(rows: list[dict[str, Any]], cfg: Config) -> str:
     else:
         lines += ["", muted("当前没有非正常分组账号")]
     return clamp_message("\n".join(lines))
+
+
+def build_recharge_event_message(rows: list[dict[str, Any]], cfg: Config) -> str:
+    balance_delta = sum((recharge_event_balance_delta(row) for row in rows), Decimal("0"))
+    balance_count = sum(1 for row in rows if recharge_event_balance_delta(row) != 0)
+    entitlement_count = max(0, len(rows) - balance_count)
+    if balance_count and entitlement_count:
+        summary = f"新增 {len(rows)} 条 / 余额合计 {fmt_signed_amount(balance_delta)} / 权益 {entitlement_count} 条"
+    elif balance_count:
+        summary = f"新增 {len(rows)} 条 / 余额合计 {fmt_signed_amount(balance_delta)}"
+    else:
+        summary = f"新增 {len(rows)} 条兑换/订阅事件"
+    lines = [
+        "💰 <b>Sub2API 用户充值/兑换</b>",
+        muted(now_iso(cfg.tzinfo())),
+        h(summary),
+        "",
+        section("事件明细"),
+    ]
+    for row in rows[: cfg.detail_limit]:
+        lines.extend(format_recharge_event_lines(row, cfg))
+    if len(rows) > cfg.detail_limit:
+        lines.append(muted(f"另有 {len(rows) - cfg.detail_limit} 条充值/兑换事件未展开"))
+    return clamp_message("\n".join(lines))
+
+
+def format_recharge_event_lines(row: dict[str, Any], cfg: Config) -> list[str]:
+    uid = row.get("user_id") or row.get("id")
+    ident = tg_code(f"#{uid}") if uid not in (None, "") else tg_code(recharge_event_record_label(row))
+    name = display_user_identifier(row, cfg)
+    meta_bits = [str(row.get("role") or "").strip(), str(row.get("status") or "").strip()]
+    if row.get("user_deleted_at"):
+        meta_bits.append("deleted")
+    meta = ", ".join(bit for bit in meta_bits if bit)
+    type_label = recharge_event_type_label(row)
+    head_bits = ["•", ident]
+    if name:
+        head_bits.append(h(name))
+    if meta:
+        head_bits.append(h(f"({meta})"))
+    if type_label:
+        head_bits.append(tg_code(type_label))
+    lines = [" ".join(head_bits)]
+    detail = recharge_event_detail(row)
+    if detail:
+        lines.append(f"  {h(detail)}")
+    notes = truncate(str(row.get("notes") or "").strip(), 120)
+    if notes and row.get("source") != "user_total_recharged":
+        lines.append(f"  {h('备注：' + notes)}")
+    record_bits = [recharge_event_record_label(row)]
+    event_at = row.get("event_at") or row.get("used_at") or row.get("completed_at") or row.get("created_at")
+    if event_at:
+        record_bits.append("时间：" + short_time(event_at))
+    lines.append("  " + h(" · ".join(record_bits)))
+    return lines
+
+
+def recharge_event_type_label(row: dict[str, Any]) -> str:
+    source = str(row.get("source") or "")
+    code_type = str(row.get("type") or "")
+    if source == "payment_order":
+        return "订阅订单"
+    labels = {
+        "balance": "余额",
+        "admin_balance": "后台余额",
+        "affiliate_balance": "邀请返利",
+        "concurrency": "并发",
+        "admin_concurrency": "后台并发",
+        "subscription": "订阅",
+    }
+    return labels.get(code_type, code_type)
+
+
+def recharge_event_detail(row: dict[str, Any]) -> str:
+    source = str(row.get("source") or "")
+    code_type = str(row.get("type") or "")
+    if source == "payment_order":
+        bits = [f"订阅购买/续期：{recharge_event_group_label(row)}"]
+        if row.get("subscription_days") not in (None, ""):
+            bits.append(f"{row.get('subscription_days')} 天")
+        if row.get("payment_type"):
+            bits.append(f"支付：{row.get('payment_type')}")
+        bits.append(f"订单金额：{fmt_amount(row.get('value'))}")
+        if row.get("pay_amount") not in (None, ""):
+            bits.append(f"实付：{fmt_amount(row.get('pay_amount'))}")
+        return " · ".join(bits)
+    if code_type in {"balance", "admin_balance", "affiliate_balance"} or source == "user_total_recharged":
+        label = {
+            "admin_balance": "后台余额调整",
+            "affiliate_balance": "邀请返利转入余额",
+        }.get(code_type, "余额充值/兑换")
+        if source == "user_total_recharged":
+            label = "余额充值"
+        bits = [f"{label}：{fmt_signed_amount(row.get('value') or row.get('_recharge_delta'))}"]
+        balance_value = row.get("balance_after") if row.get("balance_after") not in (None, "") else row.get("balance")
+        if balance_value not in (None, ""):
+            bits.append(f"余额：{fmt_amount(balance_value)}")
+        if row.get("total_recharged") not in (None, "") and source != "affiliate_transfer":
+            bits.append(f"累计：{fmt_amount(row.get('total_recharged'))}")
+        return " · ".join(bits)
+    if code_type in {"concurrency", "admin_concurrency"}:
+        label = "后台并发调整" if code_type == "admin_concurrency" else "并发兑换"
+        return f"{label}：{fmt_signed_amount(row.get('value'))}"
+    if code_type == "subscription":
+        bits = [f"订阅兑换/续期：{recharge_event_group_label(row)}"]
+        if row.get("validity_days") not in (None, ""):
+            bits.append(f"{row.get('validity_days')} 天")
+        return " · ".join(bits)
+    return f"{code_type or source}：{fmt_amount(row.get('value'))}"
+
+
+def recharge_event_group_label(row: dict[str, Any]) -> str:
+    if str(row.get("group_name") or "").strip():
+        return str(row.get("group_name")).strip()
+    if row.get("group_id") not in (None, ""):
+        return f"分组#{row.get('group_id')}"
+    return "订阅分组"
+
+
+def recharge_event_record_label(row: dict[str, Any]) -> str:
+    source = str(row.get("source") or "")
+    rid = row.get("record_id")
+    if source == "redeem_code":
+        return f"兑换记录#{rid}"
+    if source == "payment_order":
+        return f"支付订单#{rid}"
+    if source == "affiliate_transfer":
+        if row.get("source_order_id") not in (None, ""):
+            return f"返利流水#{rid}（来源订单#{row.get('source_order_id')}）"
+        return f"返利流水#{rid}"
+    if source == "user_total_recharged":
+        return "累计充值差额兜底"
+    return f"记录#{rid}"
 
 
 def build_user_recharge_message(rows: list[dict[str, Any]], cfg: Config) -> str:
@@ -2510,6 +3028,7 @@ def main(argv: list[str] | None = None) -> int:
             "account_summary": summary_lines,
             "user_recharge_alerts_enabled": cfg.user_recharge_alerts_enabled,
             "user_recharges_initialized": mon.state.get("user_recharges_initialized"),
+            "recharge_events_initialized": mon.state.get("recharge_events_initialized"),
             "last_error_id": mon.state.get("last_error_id"),
         }, ensure_ascii=False, indent=2))
         return 0

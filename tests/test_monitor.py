@@ -268,6 +268,12 @@ class PredicateTests(unittest.TestCase):
             def current_user_recharge_rows(self):
                 return self.snapshots.pop(0)
 
+            def baseline_recharge_event_cursors(self):
+                self.state["recharge_events_initialized"] = True
+
+            def fetch_new_recharge_events(self):
+                return []
+
         with tempfile.TemporaryDirectory() as tmp:
             cfg = m.Config(state_file=f"{tmp}/state.json")
             mon = FakeMonitor(
@@ -304,6 +310,185 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("用户充值", message)
         self.assertIn("充值：+25", message)
         self.assertIn("累计：125", message)
+
+    def test_recharge_event_message_includes_balance_and_subscription_records(self):
+        cfg = m.Config()
+        message = m.build_recharge_event_message(
+            [
+                {
+                    "source": "redeem_code",
+                    "event_key": "redeem:10",
+                    "record_id": 10,
+                    "event_at": "2026-06-01 12:10:14+08",
+                    "user_id": 9,
+                    "email": "28abcd@qq.com",
+                    "username": "member",
+                    "role": "user",
+                    "status": "active",
+                    "balance": "32.90506360",
+                    "total_recharged": "1060.00000000",
+                    "type": "balance",
+                    "value": "50.00000000",
+                    "code": "SECRET-CODE-SHOULD-NOT-LEAK",
+                },
+                {
+                    "source": "redeem_code",
+                    "event_key": "redeem:11",
+                    "record_id": 11,
+                    "event_at": "2026-06-01 12:11:14+08",
+                    "user_id": 9,
+                    "email": "28abcd@qq.com",
+                    "username": "member",
+                    "role": "user",
+                    "status": "active",
+                    "type": "subscription",
+                    "value": "0",
+                    "group_id": 3,
+                    "group_name": "Claude Max",
+                    "validity_days": 30,
+                },
+            ],
+            cfg,
+        )
+
+        self.assertIn("用户充值/兑换", message)
+        self.assertIn("余额合计 +50", message)
+        self.assertIn("余额充值/兑换：+50", message)
+        self.assertIn("订阅兑换/续期：Claude Max · 30 天", message)
+        self.assertIn("兑换记录#10", message)
+        self.assertIn("兑换记录#11", message)
+        self.assertNotIn("SECRET-CODE-SHOULD-NOT-LEAK", message)
+
+    def test_recharge_event_check_alerts_redeem_records_and_dedupes_total_fallback(self):
+        class FakeMonitor(m.Monitor):
+            def __init__(self, cfg, user_snapshots, event_snapshots):
+                self.user_snapshots = list(user_snapshots)
+                self.event_snapshots = list(event_snapshots)
+                super().__init__(cfg, dry_run=True)
+
+            def current_user_recharge_rows(self):
+                return self.user_snapshots.pop(0)
+
+            def baseline_recharge_event_cursors(self):
+                self.state["recharge_events_initialized"] = True
+                self.state["last_redeem_code_event_at"] = "2026-06-01 00:00:00+08"
+                self.state["last_redeem_code_event_id"] = 1
+
+            def fetch_new_recharge_events(self):
+                return self.event_snapshots.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = m.Config(state_file=f"{tmp}/state.json")
+            mon = FakeMonitor(
+                cfg,
+                [
+                    [
+                        {
+                            "id": 6,
+                            "email": "downstream@example.com",
+                            "username": "",
+                            "role": "user",
+                            "status": "active",
+                            "balance": "10.00000000",
+                            "total_recharged": "100.00000000",
+                        }
+                    ],
+                    [
+                        {
+                            "id": 6,
+                            "email": "downstream@example.com",
+                            "username": "",
+                            "role": "user",
+                            "status": "active",
+                            "balance": "35.00000000",
+                            "total_recharged": "125.00000000",
+                        }
+                    ],
+                ],
+                [
+                    [
+                        {
+                            "source": "redeem_code",
+                            "event_key": "redeem:88",
+                            "record_id": 88,
+                            "event_at": "2026-06-01 12:10:14+08",
+                            "user_id": 6,
+                            "email": "downstream@example.com",
+                            "username": "",
+                            "role": "user",
+                            "status": "active",
+                            "balance": "35.00000000",
+                            "total_recharged": "125.00000000",
+                            "type": "balance",
+                            "value": "25.00000000",
+                        }
+                    ]
+                ],
+            )
+
+            self.assertIsNone(mon.check_user_recharges())
+            message = mon.check_user_recharges()
+
+        self.assertIn("用户充值/兑换", message)
+        self.assertIn("兑换记录#88", message)
+        self.assertIn("余额充值/兑换：+25", message)
+        self.assertNotIn("累计充值差额兜底", message)
+
+    def test_recharge_event_check_alerts_subscription_without_total_recharged_increase(self):
+        class FakeMonitor(m.Monitor):
+            def __init__(self, cfg, user_snapshots, event_snapshots):
+                self.user_snapshots = list(user_snapshots)
+                self.event_snapshots = list(event_snapshots)
+                super().__init__(cfg, dry_run=True)
+
+            def current_user_recharge_rows(self):
+                return self.user_snapshots.pop(0)
+
+            def baseline_recharge_event_cursors(self):
+                self.state["recharge_events_initialized"] = True
+
+            def fetch_new_recharge_events(self):
+                return self.event_snapshots.pop(0)
+
+        user_row = {
+            "id": 7,
+            "email": "subscriber@example.com",
+            "username": "",
+            "role": "user",
+            "status": "active",
+            "balance": "0",
+            "total_recharged": "0",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = m.Config(state_file=f"{tmp}/state.json")
+            mon = FakeMonitor(
+                cfg,
+                [[dict(user_row)], [dict(user_row)]],
+                [
+                    [
+                        {
+                            "source": "redeem_code",
+                            "event_key": "redeem:99",
+                            "record_id": 99,
+                            "event_at": "2026-06-01 12:10:14+08",
+                            "user_id": 7,
+                            "email": "subscriber@example.com",
+                            "role": "user",
+                            "status": "active",
+                            "type": "subscription",
+                            "value": "0",
+                            "group_name": "Claude Max",
+                            "validity_days": 30,
+                        }
+                    ]
+                ],
+            )
+
+            self.assertIsNone(mon.check_user_recharges())
+            message = mon.check_user_recharges()
+
+        self.assertIn("新增 1 条兑换/订阅事件", message)
+        self.assertIn("订阅兑换/续期：Claude Max · 30 天", message)
 
     def test_telegram_bot_commands_are_valid_for_api(self):
         for command in m.TELEGRAM_BOT_COMMANDS:

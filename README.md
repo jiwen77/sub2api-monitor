@@ -13,7 +13,7 @@ _A passive Sub2API monitoring daemon that sends privacy-aware Telegram alerts._
 | Capability | What it does |
 | --- | --- |
 | Account alerts | Detects account additions, removals, group changes, and health changes such as error, rate limit, overload, temporary unschedulable, and expiry states |
-| Recharge alerts | Detects increases in `users.total_recharged` and reports the recharge delta, cumulative recharge, and current balance |
+| Recharge/redeem alerts | Detects new used `redeem_codes`, subscription `payment_orders`, affiliate balance transfers, and falls back to `users.total_recharged` deltas on older schemas |
 | Upstream error alerts | Reads `ops_error_logs` and reports actionable provider-side `429` and `5xx` failures |
 | Exit-network alerts | Separately reports proxy, DNS, timeout, TLS, and connection failures without exposing proxy credentials |
 | Daily usage reports | Summarizes request count, token usage, cost, account-plan breakdowns, and top models |
@@ -33,17 +33,20 @@ The project is designed for public GitHub hosting and privacy-aware operations.
 | Database access | The monitor only reads Sub2API tables through `psql`; it does not write application data |
 | Examples | README examples use placeholders or masked identifiers only |
 
-Example recharge alert with redaction enabled:
+Example recharge/redeem alert with redaction enabled:
 
 ```text
-💰 Sub2API 用户充值
+💰 Sub2API 用户充值/兑换
 2026-06-01 13:45:20 CST
-新增 1 笔 / 合计 +50
+新增 2 条 / 余额合计 +50 / 权益 1 条
 
-充值明细
+事件明细
 • #42 us***@ex*** (user, active)
-  充值：+50 · 累计：150 · 余额：75
-  更新时间：06-01 13:45
+  余额充值/兑换：+50 · 余额：75 · 累计：150
+  兑换记录#120 · 时间：06-01 13:45
+• #42 us***@ex*** (user, active)
+  订阅兑换/续期：Claude Max · 30 天
+  兑换记录#121 · 时间：06-01 13:46
 ```
 
 ## 🧭 How it works
@@ -66,7 +69,7 @@ flowchart LR
     class telegram output
 ```
 
-The daemon stores small local baselines in `STATE_FILE` so it can detect changes between polling intervals. Existing recharge totals are baselined on first run, so enabling the feature does not replay historical recharges.
+The daemon stores small local baselines in `STATE_FILE` so it can detect changes between polling intervals. Existing recharge/redeem records and recharge totals are baselined on first run, so enabling the feature does not replay historical events.
 
 ## ✅ Requirements
 
@@ -140,7 +143,7 @@ Important options:
 | `POLL_INTERVAL_SECONDS` | `60` | Daemon polling interval. Recharges detected within one interval are grouped into one notification |
 | `REDACT_IDENTIFIERS` | `true` | Redact account and user names/emails in Telegram messages |
 | `DETAIL_LIMIT` | `12` | Maximum rows expanded in one Telegram card |
-| `USER_RECHARGE_ALERTS_ENABLED` | `true` | Send Telegram notifications when `users.total_recharged` increases |
+| `USER_RECHARGE_ALERTS_ENABLED` | `true` | Send Telegram notifications for new recharge/redeem events (`redeem_codes`, subscription `payment_orders`, affiliate transfers, with `users.total_recharged` fallback) |
 | `ERROR_LOOKBACK_MINUTES` | `30` | Lookback window for new upstream errors |
 | `ERROR_COOLDOWN_SECONDS` | `600` | Per-error-group cooldown to reduce repeated alerts |
 | `UPSTREAM_ALLOWED_STATUS_CODES` | `429,500-599` | Provider/upstream HTTP statuses that should alert |
@@ -157,7 +160,7 @@ Use menu option `13) 交互式修改配置项` for guided edits, or option `14) 
 | Category | Source table | Trigger |
 | --- | --- | --- |
 | Account status | `accounts`, `account_groups`, `groups` | Account state or group-membership changes from the previous baseline |
-| User recharge | `users` | `total_recharged` increases after the first baseline |
+| User recharge/redeem | `redeem_codes`, `payment_orders`, `user_affiliate_ledger`, `users` | New used redeem records, completed subscription payment orders, affiliate balance transfers, or `total_recharged` fallback deltas after the first baseline |
 | Upstream error | `ops_error_logs` | Provider-side actionable status codes, usually `429` or `5xx` |
 | Exit-network error | `ops_error_logs` | Proxy, DNS, timeout, TLS, connection reset/refused, or similar failures |
 | Daily usage | `usage_logs` | Scheduled local-time daily summary |
