@@ -1289,7 +1289,7 @@ FROM {spec.table} t
             for record_id in sorted(previous_table.keys() - current_table.keys(), key=settings_audit_record_sort_key):
                 changes.append(settings_audit_change(table, spec, "removed", previous_table[record_id], None))
             for record_id in sorted(current_table.keys() & previous_table.keys(), key=settings_audit_record_sort_key):
-                before = previous_table[record_id]
+                before = settings_audit_normalize_stored_snapshot(spec, previous_table[record_id])
                 after = current_table[record_id]
                 if before.get("fingerprint") == after.get("fingerprint"):
                     continue
@@ -1949,6 +1949,8 @@ def audit_json_key_ignored(parent_field: str, key: str) -> bool:
         key_l.startswith("codex_") and (
             key_l.endswith("_used_percent")
             or key_l.endswith("_reset_at")
+            or key_l.endswith("_reset_after_seconds")
+            or key_l.endswith("_window_minutes")
             or key_l in {"codex_usage_updated_at"}
         )
     ):
@@ -1979,6 +1981,45 @@ def audit_value_contains_sensitive(value: Any) -> bool:
     if isinstance(value, list):
         return any(audit_value_contains_sensitive(v) for v in value)
     return False
+
+
+def settings_audit_filter_stored_value(parent_field: str, value: Any) -> Any:
+    if isinstance(value, dict):
+        if audit_value_is_sensitive(value):
+            return value
+        return {
+            str(k): settings_audit_filter_stored_value(str(k), v)
+            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+            if not audit_json_key_ignored(parent_field, str(k))
+        }
+    if isinstance(value, list):
+        return [settings_audit_filter_stored_value(parent_field, item) for item in value]
+    if isinstance(value, tuple):
+        return [settings_audit_filter_stored_value(parent_field, item) for item in value]
+    return value
+
+
+def settings_audit_normalize_stored_snapshot(spec: SettingsAuditSpec, snapshot: dict[str, Any]) -> dict[str, Any]:
+    values = snapshot.get("values") or {}
+    if not isinstance(values, dict):
+        return snapshot
+    ignored = set(SETTINGS_AUDIT_COMMON_IGNORED_FIELDS) | set(spec.ignored_fields)
+    normalized_values: dict[str, Any] = {}
+    changed = False
+    for field, value in sorted(values.items()):
+        if field in ignored:
+            changed = True
+            continue
+        filtered = settings_audit_filter_stored_value(str(field), value)
+        normalized_values[str(field)] = filtered
+        if filtered != value:
+            changed = True
+    if not changed:
+        return snapshot
+    normalized = dict(snapshot)
+    normalized["values"] = normalized_values
+    normalized["fingerprint"] = stable_hash(canonical_audit_json(normalized_values))
+    return normalized
 
 
 def audit_changed_fields(before: dict[str, Any], after: dict[str, Any]) -> list[str]:

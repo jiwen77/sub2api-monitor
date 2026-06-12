@@ -667,6 +667,10 @@ class PredicateTests(unittest.TestCase):
             "extra": {
                 "codex_5h_used_percent": 10,
                 "codex_5h_reset_at": "2026-06-01T00:00:00Z",
+                "codex_5h_reset_after_seconds": 15415,
+                "codex_5h_window_minutes": 300,
+                "codex_7d_reset_after_seconds": 479826,
+                "codex_7d_window_minutes": 10080,
                 "codex_usage_updated_at": "2026-06-01T00:00:00Z",
                 "codex_cli_only_allowed_clients": ["claude_code"],
             },
@@ -680,6 +684,10 @@ class PredicateTests(unittest.TestCase):
         rotated["extra"] = {
             "codex_5h_used_percent": 95,
             "codex_5h_reset_at": "2026-06-01T01:00:00Z",
+            "codex_5h_reset_after_seconds": 15317,
+            "codex_5h_window_minutes": 300,
+            "codex_7d_reset_after_seconds": 479729,
+            "codex_7d_window_minutes": 10080,
             "codex_usage_updated_at": "2026-06-01T01:00:00Z",
             "codex_cli_only_allowed_clients": ["claude_code"],
         }
@@ -694,6 +702,45 @@ class PredicateTests(unittest.TestCase):
             m.settings_audit_snapshot(spec, rotated)["fingerprint"],
             m.settings_audit_snapshot(spec, changed_refresh)["fingerprint"],
         )
+
+    def test_settings_audit_cleans_legacy_codex_countdown_from_state(self):
+        spec = m.settings_audit_spec_by_table()["accounts"]
+        legacy_values = {
+            "id": 113,
+            "name": "member@example.com",
+            "extra": {
+                "codex_5h_reset_after_seconds": 15415,
+                "codex_5h_window_minutes": 300,
+                "codex_7d_reset_after_seconds": 479826,
+                "codex_7d_window_minutes": 10080,
+                "codex_cli_only_allowed_clients": ["claude_code"],
+            },
+        }
+        legacy_snapshot = {
+            "id": "113",
+            "label": "账号 #113 member@example.com",
+            "values": legacy_values,
+            "fingerprint": m.stable_hash(m.canonical_audit_json(legacy_values)),
+        }
+        current = m.settings_audit_snapshot(
+            spec,
+            {
+                "id": 113,
+                "name": "member@example.com",
+                "extra": {
+                    "codex_5h_reset_after_seconds": 15317,
+                    "codex_5h_window_minutes": 300,
+                    "codex_7d_reset_after_seconds": 479729,
+                    "codex_7d_window_minutes": 10080,
+                    "codex_cli_only_allowed_clients": ["claude_code"],
+                },
+            },
+        )
+
+        cleaned = m.settings_audit_normalize_stored_snapshot(spec, legacy_snapshot)
+
+        self.assertEqual(cleaned["fingerprint"], current["fingerprint"])
+        self.assertEqual(m.audit_changed_fields(cleaned, current), [])
 
     def test_settings_change_check_baselines_then_alerts_multiple_admin_areas(self):
         class FakeMonitor(m.Monitor):
