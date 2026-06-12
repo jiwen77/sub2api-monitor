@@ -13,8 +13,10 @@ _A passive Sub2API monitoring daemon that sends privacy-aware Telegram alerts._
 | Capability | What it does |
 | --- | --- |
 | Account alerts | Detects account additions, removals, group changes, and health changes such as error, rate limit, overload, temporary unschedulable, and expiry states |
+| Settings-change alerts | Detects background admin/config changes across account, subscription/payment, user-management, and system-setting tables, with readable before/after diffs |
+| Risk-control alerts | Detects new `content_moderation_logs` hits/blocks/errors from the Sub2API risk-control center and summarizes the affected user, key, group, model, action, score, and auto-ban status |
 | Recharge/redeem alerts | Detects new used `redeem_codes`, subscription `payment_orders`, affiliate balance transfers, and falls back to `users.total_recharged` deltas on older schemas |
-| Upstream error alerts | Reads `ops_error_logs` and reports actionable provider-side `429` and `5xx` failures |
+| Upstream error alerts | Reads `ops_error_logs` and reports actionable provider-side `400`, `429`, and `5xx` failures |
 | Exit-network alerts | Separately reports proxy, DNS, timeout, TLS, and connection failures without exposing proxy credentials |
 | Daily usage reports | Summarizes request count, token usage, cost, account-plan breakdowns, and top models |
 | Telegram commands | Supports `/status`, `/accounts`, `/groups`, `/daily`, `/update`, `/ping`, and `/help` while the daemon is running |
@@ -28,6 +30,8 @@ The project is designed for public GitHub hosting and privacy-aware operations.
 | --- | --- |
 | Secrets | Real Telegram tokens, chat IDs, database passwords, and Sub2API `.env` values stay outside the repository |
 | User identifiers | Account and user names/emails are redacted by default with `REDACT_IDENTIFIERS=true` |
+| Settings diffs | Sensitive fields such as tokens, passwords, API keys, payment configs, and encrypted secrets are compared by hash and shown only as “set/updated/cleared” |
+| Risk-control logs | Telegram risk-control alerts omit request IDs and show only the redacted user/key context plus a short already-redacted prompt excerpt |
 | Proxy data | Proxy alert cards show safe labels such as name, ID, protocol, and status, but not host, username, or password |
 | Low-level IDs | Request IDs and raw ops-log IDs are omitted from default Telegram alert text |
 | Database access | The monitor only reads Sub2API tables through `psql`; it does not write application data |
@@ -143,10 +147,14 @@ Important options:
 | `POLL_INTERVAL_SECONDS` | `60` | Daemon polling interval. Recharges detected within one interval are grouped into one notification |
 | `REDACT_IDENTIFIERS` | `true` | Redact account and user names/emails in Telegram messages |
 | `DETAIL_LIMIT` | `12` | Maximum rows expanded in one Telegram card |
+| `SETTINGS_CHANGE_ALERTS_ENABLED` | `true` | Send Telegram notifications when monitored admin/config tables change after the first baseline |
+| `SETTINGS_CHANGE_TABLES` | empty | Optional comma-separated allowlist of tables to audit; empty uses built-in Sub2API admin/config tables and skips missing tables |
+| `RISK_CONTROL_ALERTS_ENABLED` | `true` | Send Telegram notifications for new risk-control/content-moderation hits, blocks, hash/keyword blocks, auto-bans, and moderation errors after the first baseline |
+| `RISK_CONTROL_ALERT_LIMIT_PER_POLL` | `500` | Maximum `content_moderation_logs` rows read per polling interval |
 | `USER_RECHARGE_ALERTS_ENABLED` | `true` | Send Telegram notifications for new recharge/redeem events (`redeem_codes`, subscription `payment_orders`, affiliate transfers, with `users.total_recharged` fallback) |
 | `ERROR_LOOKBACK_MINUTES` | `30` | Lookback window for new upstream errors |
 | `ERROR_COOLDOWN_SECONDS` | `600` | Per-error-group cooldown to reduce repeated alerts |
-| `UPSTREAM_ALLOWED_STATUS_CODES` | `429,500-599` | Provider/upstream HTTP statuses that should alert |
+| `UPSTREAM_ALLOWED_STATUS_CODES` | `400,429,500-599` | Provider/upstream HTTP statuses that should alert |
 | `PROXY_ERROR_ALERTS_ENABLED` | `true` | Separately alert likely exit-proxy and network failures |
 | `DAILY_REPORT_HOUR` | `0` | Local hour for daily report |
 | `DAILY_REPORT_MINUTE` | `0` | Local minute for daily report |
@@ -160,8 +168,10 @@ Use menu option `13) 交互式修改配置项` for guided edits, or option `14) 
 | Category | Source table | Trigger |
 | --- | --- | --- |
 | Account status | `accounts`, `account_groups`, `groups` | Account state or group-membership changes from the previous baseline |
+| Settings/admin changes | `accounts`, `account_groups`, `groups`, `proxies`, `users`, `api_keys`, `user_allowed_groups`, `subscription_plans`, `user_subscriptions`, `payment_provider_instances`, `settings`, `announcements`, `channel_monitors`, and related admin/config tables | Any material row add/remove/update after the first baseline; runtime counters and high-churn usage windows are ignored to prevent noise |
+| Risk-control trigger | `content_moderation_logs` | New flagged, blocked, keyword/hash-blocked, auto-banned, or moderation-error rows after the first baseline |
 | User recharge/redeem | `redeem_codes`, `payment_orders`, `user_affiliate_ledger`, `users` | New used redeem records, completed subscription payment orders, affiliate balance transfers, or `total_recharged` fallback deltas after the first baseline |
-| Upstream error | `ops_error_logs` | Provider-side actionable status codes, usually `429` or `5xx` |
+| Upstream error | `ops_error_logs` | Provider-side actionable status codes, usually `400`, `429`, or `5xx` |
 | Exit-network error | `ops_error_logs` | Proxy, DNS, timeout, TLS, connection reset/refused, or similar failures |
 | Daily usage | `usage_logs` | Scheduled local-time daily summary |
 
@@ -194,7 +204,7 @@ python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/co
 # Force-send the current account snapshot to Telegram.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env account-summary --notify
 
-# Run account, recharge, and upstream-error checks once.
+# Run account, settings-change, risk-control, recharge, and upstream-error checks once.
 python3 /opt/sub2api-monitor/sub2api_monitor.py --config /etc/sub2api-monitor/config.env run-once --notify
 
 # Force-send the daily usage report.

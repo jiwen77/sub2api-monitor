@@ -222,6 +222,10 @@ print_config_summary() {
   echo "启动时发送账号基线: $(get_env_value SEND_STARTUP_SUMMARY true)"
   echo "账号信息脱敏: $(get_env_value REDACT_IDENTIFIERS true)"
   echo "每条消息最多展开: $(get_env_value DETAIL_LIMIT 12) 条"
+  echo "后台设置改动通知: $(get_env_value SETTINGS_CHANGE_ALERTS_ENABLED true)"
+  echo "设置审计表白名单: $(get_env_value SETTINGS_CHANGE_TABLES '')"
+  echo "风控触发通知: $(get_env_value RISK_CONTROL_ALERTS_ENABLED true)"
+  echo "风控日志读取上限: $(get_env_value RISK_CONTROL_ALERT_LIMIT_PER_POLL 500) 条/轮"
   echo "用户充值通知: $(get_env_value USER_RECHARGE_ALERTS_ENABLED true)"
   echo "TG 命令开关: $(get_env_value TELEGRAM_COMMANDS_ENABLED true)"
   echo "TG 命令检查频率: $(get_env_value TELEGRAM_COMMAND_POLL_INTERVAL_SECONDS 5) 秒"
@@ -230,7 +234,7 @@ print_config_summary() {
   echo "上游错误回看窗口: $(get_env_value ERROR_LOOKBACK_MINUTES 30) 分钟"
   echo "上游错误读取上限: $(get_env_value ERROR_LIMIT_PER_POLL 500) 条/轮"
   echo "同类错误冷却时间: $(get_env_value ERROR_COOLDOWN_SECONDS 600) 秒"
-  echo "告警状态码: $(get_env_value UPSTREAM_ALLOWED_STATUS_CODES '429,500-599')"
+  echo "告警状态码: $(get_env_value UPSTREAM_ALLOWED_STATUS_CODES '400,429,500-599')"
   echo "首次启动告警历史错误: $(get_env_value ALERT_EXISTING_ERRORS_ON_FIRST_RUN false)"
   echo "出口/网络错误告警: $(get_env_value PROXY_ERROR_ALERTS_ENABLED true)"
   local daily_hour daily_minute
@@ -277,7 +281,7 @@ configure_runtime_options() {
     echo " 1) 查看当前常用配置"
     echo " 2) 监控频率/时区"
     echo " 3) Telegram 命令设置（/status 等）"
-    echo " 4) 账号/充值告警显示设置"
+    echo " 4) 账号/充值/设置告警显示设置"
     echo " 5) 上游错误告警设置"
     echo " 6) 日报时间设置"
     echo " 7) Sub2API / 数据库连接设置"
@@ -299,14 +303,18 @@ configure_runtime_options() {
       4)
         prompt_bool SEND_STARTUP_SUMMARY "监控启动/重启时是否发送账号基线" true
         prompt_bool REDACT_IDENTIFIERS "TG 消息里是否隐藏账号邮箱/名称" true
-        prompt_int DETAIL_LIMIT "每条消息最多展开多少个账号/错误" 12 1 100
+        prompt_int DETAIL_LIMIT "每条消息最多展开多少个账号/错误/设置改动" 12 1 100
+        prompt_bool SETTINGS_CHANGE_ALERTS_ENABLED "是否在后台账号/订阅/用户/系统设置改动时推送 TG 通知" true
+        prompt_text SETTINGS_CHANGE_TABLES "设置审计表白名单，逗号分隔；留空=内置常见后台配置表" ""
+        prompt_bool RISK_CONTROL_ALERTS_ENABLED "是否在风控中心命中/拦截时推送 TG 通知" true
+        prompt_int RISK_CONTROL_ALERT_LIMIT_PER_POLL "每轮最多读取多少条风控日志" 500 1 5000
         prompt_bool USER_RECHARGE_ALERTS_ENABLED "是否在用户充值时推送 TG 通知" true
         ;;
       5)
         prompt_int ERROR_LOOKBACK_MINUTES "每轮检查最近多少分钟内的上游错误" 30 1 1440
         prompt_int ERROR_LIMIT_PER_POLL "每轮最多读取多少条错误日志" 500 1 5000
         prompt_int ERROR_COOLDOWN_SECONDS "同类错误冷却时间，避免刷屏；0 表示不冷却" 600 0 86400
-        prompt_text UPSTREAM_ALLOWED_STATUS_CODES "哪些上游 HTTP 状态码会告警，例如 429,500-599" "429,500-599"
+        prompt_text UPSTREAM_ALLOWED_STATUS_CODES "哪些上游 HTTP 状态码会告警，例如 400,429,500-599" "400,429,500-599"
         prompt_bool ALERT_EXISTING_ERRORS_ON_FIRST_RUN "首次启动是否告警历史错误；通常建议 false" false
         prompt_bool PROXY_ERROR_ALERTS_ENABLED "是否单独告警出口代理/DNS/连接超时等网络错误" true
         ;;

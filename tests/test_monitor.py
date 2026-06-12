@@ -7,10 +7,15 @@ import sub2api_monitor as m
 
 class PredicateTests(unittest.TestCase):
     def test_status_ranges(self):
-        ranges = m.parse_allowed_status("429,500-599")
+        ranges = m.parse_allowed_status("400,429,500-599")
+        self.assertTrue(m.status_allowed(400, ranges))
         self.assertTrue(m.status_allowed(429, ranges))
         self.assertTrue(m.status_allowed(503, ranges))
         self.assertFalse(m.status_allowed(401, ranges))
+
+    def test_default_upstream_error_statuses_include_bad_request(self):
+        mon = m.Monitor(m.Config(), dry_run=True)
+        self.assertTrue(m.status_allowed(400, mon.allowed_status))
 
     def test_error_filter_excludes_auth_and_network(self):
         cfg = m.Config()
@@ -489,6 +494,255 @@ class PredicateTests(unittest.TestCase):
 
         self.assertIn("新增 1 条兑换/订阅事件", message)
         self.assertIn("订阅兑换/续期：Claude Max · 30 天", message)
+
+    def test_content_moderation_message_redacts_and_summarizes_triggers(self):
+        cfg = m.Config()
+        message = m.build_content_moderation_message(
+            [
+                {
+                    "id": 101,
+                    "created_at": "2026-06-01 12:10:14+08",
+                    "user_id": 9,
+                    "user_email": "member@example.com",
+                    "api_key_id": 2,
+                    "api_key_name": "Claude Key",
+                    "group_name": "Claude Max",
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4",
+                    "mode": "pre_block",
+                    "action": "keyword_block",
+                    "flagged": True,
+                    "highest_category": "keyword",
+                    "highest_score": "1.0",
+                    "input_excerpt": "blocked prompt with user secret-token",
+                    "violation_count": 3,
+                    "auto_banned": False,
+                    "email_sent": True,
+                },
+                {
+                    "id": 102,
+                    "created_at": "2026-06-01 12:11:14+08",
+                    "user_id": 12,
+                    "user_email": "abuse@example.com",
+                    "api_key_name": "OpenAI Key",
+                    "group_name": "GPT Plus",
+                    "provider": "openai",
+                    "model": "gpt-5.5",
+                    "mode": "pre_block",
+                    "action": "block",
+                    "flagged": True,
+                    "highest_category": "violence",
+                    "highest_score": "0.982",
+                    "input_excerpt": "harmful prompt",
+                    "violation_count": 10,
+                    "auto_banned": True,
+                    "email_sent": False,
+                    "request_id": "req_should_not_leak",
+                },
+            ],
+            cfg,
+        )
+
+        self.assertIn("风控触发", message)
+        self.assertIn("新增 2 条 / 命中 2 / 拦截 2 / 自动封禁 1", message)
+        self.assertIn("用户 #9 me***@ex***", message)
+        self.assertIn("API Key：Claude Key", message)
+        self.assertIn("动作：关键词拦截", message)
+        self.assertIn("类别：keyword · 分数：1", message)
+        self.assertIn("次数：3 / 自动封禁：否 / 邮件：已发", message)
+        self.assertIn("用户 #12 ab***@ex***", message)
+        self.assertIn("自动封禁：是", message)
+        self.assertIn("摘要：blocked prompt with user secret-token", message)
+        self.assertNotIn("member@example.com", message)
+        self.assertNotIn("abuse@example.com", message)
+        self.assertNotIn("req_should_not_leak", message)
+
+    def test_content_moderation_check_baselines_then_alerts_only_triggers(self):
+        class FakeMonitor(m.Monitor):
+            def __init__(self, cfg, snapshots):
+                self.snapshots = list(snapshots)
+                super().__init__(cfg, dry_run=True)
+
+            def content_moderation_logs_available(self):
+                return True
+
+            def max_content_moderation_log_id(self):
+                rows = self.snapshots.pop(0)
+                return max((int(row.get("id") or 0) for row in rows), default=0)
+
+            def fetch_new_content_moderation_rows(self):
+                return self.snapshots.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = m.Config(state_file=f"{tmp}/state.json")
+            mon = FakeMonitor(
+                cfg,
+                [
+                    [
+                        {"id": 1, "action": "keyword_block", "flagged": True, "user_email": "old@example.com"},
+                    ],
+                    [
+                        {"id": 2, "action": "allow", "flagged": False, "user_email": "clean@example.com"},
+                        {
+                            "id": 3,
+                            "action": "block",
+                            "flagged": True,
+                            "user_email": "member@example.com",
+                            "highest_category": "violence",
+                            "highest_score": "0.982",
+                        },
+                    ],
+                ],
+            )
+
+            self.assertIsNone(mon.check_content_moderation_logs())
+            message = mon.check_content_moderation_logs()
+
+        self.assertIn("风控触发", message)
+        self.assertIn("新增 1 条", message)
+        self.assertIn("用户 me***@ex***", message)
+        self.assertNotIn("clean@example.com", message)
+        self.assertEqual(mon.state["last_content_moderation_log_id"], 3)
+
+    def test_settings_change_message_is_human_readable_and_secret_safe(self):
+        cfg = m.Config()
+        before = m.settings_audit_snapshot(
+            m.settings_audit_spec_by_table()["accounts"],
+            {
+                "id": 108,
+                "name": "Primary OpenAI",
+                "platform": "openai",
+                "type": "oauth",
+                "credentials": {"api_key": "sk-old-secret"},
+                "concurrency": 3,
+                "priority": 50,
+            },
+        )
+        after = m.settings_audit_snapshot(
+            m.settings_audit_spec_by_table()["accounts"],
+            {
+                "id": 108,
+                "name": "Primary OpenAI",
+                "platform": "openai",
+                "type": "oauth",
+                "credentials": {"api_key": "sk-new-secret"},
+                "concurrency": 5,
+                "priority": 50,
+            },
+        )
+
+        message = m.build_settings_change_message(
+            [
+                {
+                    "table": "accounts",
+                    "category": "账号管理",
+                    "record_label": after["label"],
+                    "operation": "changed",
+                    "before": before,
+                    "after": after,
+                    "changed_fields": m.audit_changed_fields(before, after),
+                }
+            ],
+            cfg,
+        )
+
+        self.assertIn("设置变更", message)
+        self.assertIn("账号管理", message)
+        self.assertIn("账号 #108 Primary OpenAI", message)
+        self.assertIn("并发：3 → 5", message)
+        self.assertIn("凭证：已更新", message)
+        self.assertNotIn("sk-old-secret", message)
+        self.assertNotIn("sk-new-secret", message)
+
+    def test_account_settings_audit_ignores_runtime_oauth_token_rotation(self):
+        spec = m.settings_audit_spec_by_table()["accounts"]
+        base = {
+            "id": 108,
+            "name": "Primary OpenAI",
+            "credentials": {
+                "access_token": "runtime-old",
+                "expires_at": "2026-06-01T00:00:00Z",
+                "refresh_token": "stable-refresh",
+            },
+            "extra": {
+                "codex_5h_used_percent": 10,
+                "codex_5h_reset_at": "2026-06-01T00:00:00Z",
+                "codex_usage_updated_at": "2026-06-01T00:00:00Z",
+                "codex_cli_only_allowed_clients": ["claude_code"],
+            },
+        }
+        rotated = dict(base)
+        rotated["credentials"] = {
+            "access_token": "runtime-new",
+            "expires_at": "2026-06-01T01:00:00Z",
+            "refresh_token": "stable-refresh",
+        }
+        rotated["extra"] = {
+            "codex_5h_used_percent": 95,
+            "codex_5h_reset_at": "2026-06-01T01:00:00Z",
+            "codex_usage_updated_at": "2026-06-01T01:00:00Z",
+            "codex_cli_only_allowed_clients": ["claude_code"],
+        }
+        changed_refresh = dict(rotated)
+        changed_refresh["credentials"] = dict(rotated["credentials"], refresh_token="changed-refresh")
+
+        self.assertEqual(
+            m.settings_audit_snapshot(spec, base)["fingerprint"],
+            m.settings_audit_snapshot(spec, rotated)["fingerprint"],
+        )
+        self.assertNotEqual(
+            m.settings_audit_snapshot(spec, rotated)["fingerprint"],
+            m.settings_audit_snapshot(spec, changed_refresh)["fingerprint"],
+        )
+
+    def test_settings_change_check_baselines_then_alerts_multiple_admin_areas(self):
+        class FakeMonitor(m.Monitor):
+            def __init__(self, cfg, snapshots):
+                self.snapshots = list(snapshots)
+                super().__init__(cfg, dry_run=True)
+
+            def current_settings_audit_rows(self):
+                return self.snapshots.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = m.Config(state_file=f"{tmp}/state.json")
+            mon = FakeMonitor(
+                cfg,
+                [
+                    {
+                        "accounts": [
+                            {"id": 108, "name": "Primary OpenAI", "platform": "openai", "type": "oauth", "concurrency": 3}
+                        ],
+                        "users": [
+                            {"id": 9, "email": "member@example.com", "username": "member", "role": "user", "status": "active"}
+                        ],
+                        "settings": [{"id": "payment_config", "key": "payment_config", "value": "{\"enabled\":false}"}],
+                    },
+                    {
+                        "accounts": [
+                            {"id": 108, "name": "Primary OpenAI", "platform": "openai", "type": "oauth", "concurrency": 5}
+                        ],
+                        "users": [
+                            {"id": 9, "email": "member@example.com", "username": "member", "role": "admin", "status": "active"}
+                        ],
+                        "settings": [{"id": "payment_config", "key": "payment_config", "value": "{\"enabled\":true}"}],
+                    },
+                ],
+            )
+
+            self.assertIsNone(mon.check_settings_changes())
+            message = mon.check_settings_changes()
+
+        self.assertIn("设置变更", message)
+        self.assertIn("账号管理", message)
+        self.assertIn("账号 #108 Primary OpenAI", message)
+        self.assertIn("并发：3 → 5", message)
+        self.assertIn("用户管理", message)
+        self.assertIn("用户 #9 me***@ex***", message)
+        self.assertIn("角色：user → admin", message)
+        self.assertIn("系统设置", message)
+        self.assertIn("系统设置 payment_config", message)
+        self.assertNotIn("member@example.com", message)
 
     def test_telegram_bot_commands_are_valid_for_api(self):
         for command in m.TELEGRAM_BOT_COMMANDS:

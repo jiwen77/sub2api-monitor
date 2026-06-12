@@ -4,6 +4,8 @@
 This monitor intentionally does NOT probe upstream APIs. It only reads Sub2API's
 own PostgreSQL tables (accounts, ops_error_logs, usage_logs) and reports:
 - account availability/state changes;
+- background admin/config changes;
+- risk-control/content-moderation triggers;
 - user recharge increases;
 - provider/upstream errors already observed by Sub2API;
 - daily usage summaries.
@@ -63,6 +65,32 @@ TOKEN_EXPR = (
     "coalesce(image_output_tokens,0)"
 )
 
+SETTINGS_AUDIT_COMMON_IGNORED_FIELDS = {
+    # updated_at changes on every write and creates noisy duplicate diffs; the
+    # material columns in the same row still prove what changed.
+    "created_at",
+    "updated_at",
+}
+SETTINGS_AUDIT_SENSITIVE_RE = re.compile(
+    r"(password|passwd|secret|token|api[_-]?key|access[_-]?key|refresh[_-]?key|"
+    r"credential|authorization|cookie|private|encrypted|totp|jwt|signing|security)",
+    re.I,
+)
+SETTINGS_AUDIT_EMAIL_RE = re.compile(r"([A-Za-z0-9._%+\-]{1,64})@([A-Za-z0-9.\-]{1,255})")
+SETTINGS_AUDIT_MAX_FIELD_DIFFS = 6
+CONTENT_MODERATION_ALERT_ACTIONS = {"block", "keyword_block", "hash_block", "error"}
+
+
+@dataclass
+class SettingsAuditSpec:
+    table: str
+    category: str
+    label: str
+    identity_fields: tuple[str, ...] = ("id",)
+    label_fields: tuple[str, ...] = ("name", "email", "username", "key", "title")
+    ignored_fields: tuple[str, ...] = ()
+    sensitive_fields: tuple[str, ...] = ()
+
 
 @dataclass
 class Config:
@@ -87,6 +115,10 @@ class Config:
     telegram_allowed_chat_ids: str = ""
     telegram_drop_pending_updates: bool = True
     send_startup_summary: bool = True
+    settings_change_alerts_enabled: bool = True
+    settings_change_tables: str = ""
+    risk_control_alerts_enabled: bool = True
+    risk_control_alert_limit_per_poll: int = 500
     alert_existing_errors_on_first_run: bool = False
     redact_identifiers: bool = True
     detail_limit: int = 12
@@ -94,7 +126,7 @@ class Config:
     error_lookback_minutes: int = 30
     error_limit_per_poll: int = 500
     error_cooldown_seconds: int = 600
-    upstream_allowed_status_codes: str = "429,500-599"
+    upstream_allowed_status_codes: str = "400,429,500-599"
     upstream_exclude_regex: str = (
         r"(?i)(api[\s_-]?key|user\s*key|invalid\s+key|unauthori[sz]ed|"
         r"forbidden|permission|authentication|invalidated\s+oauth\s+token|"
@@ -130,7 +162,7 @@ class Config:
         sub_env_path = Path(sub2api_dir) / ".env"
         sub_env = read_env_file(sub_env_path) if sub_env_path.exists() else {}
 
-        merged = {**sub_env, **env, **{k: v for k, v in os.environ.items() if k.startswith(("SUB2API_", "POSTGRES_", "TELEGRAM_", "USER_RECHARGE_"))}}
+        merged = {**sub_env, **env, **{k: v for k, v in os.environ.items() if k.startswith(("SUB2API_", "POSTGRES_", "TELEGRAM_", "USER_RECHARGE_", "SETTINGS_CHANGE_", "RISK_CONTROL_"))}}
         cfg = cls()
         cfg.config_path = chosen
         cfg.sub2api_dir = get_str(merged, "SUB2API_DIR", cfg.sub2api_dir)
@@ -153,6 +185,10 @@ class Config:
         cfg.telegram_allowed_chat_ids = get_str(merged, "TELEGRAM_ALLOWED_CHAT_IDS", cfg.telegram_allowed_chat_ids).strip()
         cfg.telegram_drop_pending_updates = get_bool(merged, "TELEGRAM_DROP_PENDING_UPDATES", cfg.telegram_drop_pending_updates)
         cfg.send_startup_summary = get_bool(merged, "SEND_STARTUP_SUMMARY", cfg.send_startup_summary)
+        cfg.settings_change_alerts_enabled = get_bool(merged, "SETTINGS_CHANGE_ALERTS_ENABLED", cfg.settings_change_alerts_enabled)
+        cfg.settings_change_tables = get_str(merged, "SETTINGS_CHANGE_TABLES", cfg.settings_change_tables).strip()
+        cfg.risk_control_alerts_enabled = get_bool(merged, "RISK_CONTROL_ALERTS_ENABLED", cfg.risk_control_alerts_enabled)
+        cfg.risk_control_alert_limit_per_poll = get_int(merged, "RISK_CONTROL_ALERT_LIMIT_PER_POLL", cfg.risk_control_alert_limit_per_poll, 1, 5000)
         cfg.alert_existing_errors_on_first_run = get_bool(merged, "ALERT_EXISTING_ERRORS_ON_FIRST_RUN", cfg.alert_existing_errors_on_first_run)
         cfg.redact_identifiers = get_bool(merged, "REDACT_IDENTIFIERS", cfg.redact_identifiers)
         cfg.detail_limit = get_int(merged, "DETAIL_LIMIT", cfg.detail_limit, 1, 100)
@@ -184,6 +220,8 @@ class Config:
 class MonitorResult:
     account_message: str | None = None
     recharge_message: str | None = None
+    risk_control_message: str | None = None
+    settings_message: str | None = None
     error_message: str | None = None
     daily_message: str | None = None
     changed: bool = False
@@ -201,6 +239,8 @@ class Monitor:
         self.state.setdefault("version", 1)
         self.state.setdefault("accounts", {})
         self.state.setdefault("user_recharges", {})
+        self.state.setdefault("settings_snapshots", {})
+        self.state.setdefault("last_content_moderation_log_id", 0)
         self.state.setdefault("last_error_id", 0)
         self.state.setdefault("error_cooldowns", {})
         self.allowed_status = parse_allowed_status(self.cfg.upstream_allowed_status_codes)
@@ -236,6 +276,32 @@ class Monitor:
         except Exception:
             logging.exception("user recharge check failed")
             msg = build_simple_alert("⚠️ 用户充值检查失败", short_exc(), self.cfg)
+            if notify:
+                self.send(msg)
+
+        try:
+            risk_msg = self.check_content_moderation_logs()
+            if risk_msg:
+                result.risk_control_message = risk_msg
+                result.changed = True
+                if notify:
+                    self.send(risk_msg)
+        except Exception:
+            logging.exception("risk control check failed")
+            msg = build_simple_alert("⚠️ 风控触发检查失败", short_exc(), self.cfg)
+            if notify:
+                self.send(msg)
+
+        try:
+            settings_msg = self.check_settings_changes()
+            if settings_msg:
+                result.settings_message = settings_msg
+                result.changed = True
+                if notify:
+                    self.send(settings_msg)
+        except Exception:
+            logging.exception("settings change check failed")
+            msg = build_simple_alert("⚠️ 设置变更检查失败", short_exc(), self.cfg)
             if notify:
                 self.send(msg)
 
@@ -1046,6 +1112,200 @@ SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
         events.sort(key=recharge_event_sort_key)
         return build_recharge_event_message(events, self.cfg)
 
+    def content_moderation_logs_available(self) -> bool:
+        return self.table_has_columns(
+            "content_moderation_logs",
+            {
+                "id",
+                "created_at",
+                "action",
+                "flagged",
+                "user_email",
+                "highest_category",
+                "highest_score",
+                "input_excerpt",
+                "auto_banned",
+            },
+        )
+
+    def max_content_moderation_log_id(self) -> int:
+        if not self.content_moderation_logs_available():
+            return 0
+        sql = "SELECT coalesce(max(id),0)::bigint FROM content_moderation_logs;"
+        out = self.psql(sql).strip()
+        try:
+            return int(out or "0")
+        except ValueError:
+            return 0
+
+    def fetch_new_content_moderation_rows(self) -> list[dict[str, Any]]:
+        if not self.content_moderation_logs_available():
+            return []
+        last_id = int(self.state.get("last_content_moderation_log_id") or 0)
+        limit = max(1, min(int(self.cfg.risk_control_alert_limit_per_poll), 5000))
+        sql = f"""
+WITH rows AS (
+  SELECT
+    id,
+    created_at,
+    coalesce(request_id, '') AS request_id,
+    user_id,
+    coalesce(user_email, '') AS user_email,
+    api_key_id,
+    coalesce(api_key_name, '') AS api_key_name,
+    group_id,
+    coalesce(group_name, '') AS group_name,
+    coalesce(endpoint, '') AS endpoint,
+    coalesce(provider, '') AS provider,
+    coalesce(model, '') AS model,
+    coalesce(mode, '') AS mode,
+    coalesce(action, '') AS action,
+    coalesce(flagged, false) AS flagged,
+    coalesce(highest_category, '') AS highest_category,
+    coalesce(highest_score, 0)::numeric(8,6)::text AS highest_score,
+    coalesce(category_scores, '{{}}'::jsonb) AS category_scores,
+    coalesce(input_excerpt, '') AS input_excerpt,
+    upstream_latency_ms,
+    coalesce(error, '') AS error,
+    coalesce(violation_count, 0) AS violation_count,
+    coalesce(auto_banned, false) AS auto_banned,
+    coalesce(email_sent, false) AS email_sent,
+    queue_delay_ms
+  FROM content_moderation_logs
+  WHERE id > {last_id}
+  ORDER BY id ASC
+  LIMIT {limit}
+)
+SELECT coalesce(json_agg(row_to_json(rows)), '[]'::json)::text FROM rows;
+"""
+        return self.query_json(sql) or []
+
+    def check_content_moderation_logs(self) -> str | None:
+        if not self.cfg.risk_control_alerts_enabled:
+            return None
+        if not self.content_moderation_logs_available():
+            return None
+
+        initialized = bool(self.state.get("content_moderation_logs_initialized"))
+        if not initialized:
+            self.state["last_content_moderation_log_id"] = self.max_content_moderation_log_id()
+            self.state["content_moderation_logs_initialized"] = True
+            self.state["content_moderation_logs_updated_at"] = now_iso(self.cfg.tzinfo())
+            return None
+
+        rows = self.fetch_new_content_moderation_rows()
+        if not rows:
+            return None
+        max_id = max(int(row.get("id") or 0) for row in rows)
+        self.state["last_content_moderation_log_id"] = max(max_id, int(self.state.get("last_content_moderation_log_id") or 0))
+        self.state["content_moderation_logs_updated_at"] = now_iso(self.cfg.tzinfo())
+
+        alert_rows = [row for row in rows if is_alertable_content_moderation_row(row)]
+        if not alert_rows:
+            return None
+        return build_content_moderation_message(alert_rows, self.cfg)
+
+    def current_settings_audit_rows(self) -> dict[str, list[dict[str, Any]]]:
+        rows_by_table: dict[str, list[dict[str, Any]]] = {}
+        for spec in self.settings_audit_specs():
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", spec.table):
+                continue
+            columns = self.table_columns(spec.table)
+            if not columns:
+                continue
+            identity_fields = settings_audit_identity_fields(spec, columns)
+            if not identity_fields:
+                logging.info("skip settings audit table %s: no stable identity columns", spec.table)
+                continue
+            effective_spec = SettingsAuditSpec(
+                table=spec.table,
+                category=spec.category,
+                label=spec.label,
+                identity_fields=identity_fields,
+                label_fields=spec.label_fields,
+                ignored_fields=spec.ignored_fields,
+                sensitive_fields=spec.sensitive_fields,
+            )
+            rows_by_table[spec.table] = self.fetch_settings_audit_table_rows(effective_spec, columns)
+        return rows_by_table
+
+    def settings_audit_specs(self) -> list[SettingsAuditSpec]:
+        specs_by_table = settings_audit_spec_by_table()
+        raw_tables = [t.strip() for t in self.cfg.settings_change_tables.split(",") if t.strip()]
+        if not raw_tables:
+            return list(specs_by_table.values())
+        specs: list[SettingsAuditSpec] = []
+        for table in raw_tables:
+            if table in specs_by_table:
+                specs.append(specs_by_table[table])
+            else:
+                specs.append(
+                    SettingsAuditSpec(
+                        table=table,
+                        category="自定义设置",
+                        label=table,
+                        identity_fields=("id",),
+                    )
+                )
+        return specs
+
+    def fetch_settings_audit_table_rows(self, spec: SettingsAuditSpec, columns: set[str]) -> list[dict[str, Any]]:
+        order_fields = [field for field in spec.identity_fields if field in columns]
+        order_expr = ", ".join(f"t.{field}" for field in order_fields) or "1"
+        where_clause = "WHERE t.deleted_at IS NULL" if "deleted_at" in columns else ""
+        sql = f"""
+SELECT coalesce(json_agg(to_jsonb(t) ORDER BY {order_expr}), '[]'::json)::text
+FROM {spec.table} t
+{where_clause};
+"""
+        return self.query_json(sql) or []
+
+    def check_settings_changes(self) -> str | None:
+        if not self.cfg.settings_change_alerts_enabled:
+            return None
+        rows_by_table = self.current_settings_audit_rows()
+        if not rows_by_table:
+            return None
+
+        specs = settings_audit_spec_by_table()
+        previous_all: dict[str, Any] = self.state.get("settings_snapshots") or {}
+        initialized = bool(self.state.get("settings_changes_initialized"))
+        current_all: dict[str, dict[str, dict[str, Any]]] = {}
+        changes: list[dict[str, Any]] = []
+
+        for table, rows in rows_by_table.items():
+            spec = specs.get(table) or SettingsAuditSpec(table=table, category="自定义设置", label=table)
+            current_table: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                snapshot = settings_audit_snapshot(spec, row)
+                current_table[str(snapshot["id"])] = snapshot
+            current_all[table] = current_table
+
+            if not initialized or table not in previous_all:
+                continue
+            previous_table = previous_all.get(table) or {}
+            for record_id in sorted(current_table.keys() - previous_table.keys(), key=settings_audit_record_sort_key):
+                changes.append(settings_audit_change(table, spec, "added", None, current_table[record_id]))
+            for record_id in sorted(previous_table.keys() - current_table.keys(), key=settings_audit_record_sort_key):
+                changes.append(settings_audit_change(table, spec, "removed", previous_table[record_id], None))
+            for record_id in sorted(current_table.keys() & previous_table.keys(), key=settings_audit_record_sort_key):
+                before = previous_table[record_id]
+                after = current_table[record_id]
+                if before.get("fingerprint") == after.get("fingerprint"):
+                    continue
+                changed_fields = audit_changed_fields(before, after)
+                if not changed_fields:
+                    continue
+                changes.append(settings_audit_change(table, spec, "changed", before, after, changed_fields))
+
+        self.state["settings_snapshots"] = current_all
+        self.state["settings_changes_initialized"] = True
+        self.state["settings_snapshots_updated_at"] = now_iso(self.cfg.tzinfo())
+
+        if not initialized or not changes:
+            return None
+        return build_settings_change_message(changes, self.cfg)
+
     def max_ops_error_id(self) -> int:
         sql = "SELECT coalesce(max(id),0)::bigint FROM ops_error_logs;"
         out = self.psql(sql).strip()
@@ -1381,6 +1641,573 @@ def fmt_signed_amount(value: Any) -> str:
 
 def rows_by_id(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {str(r.get("id")): r for r in rows}
+
+
+def is_alertable_content_moderation_row(row: dict[str, Any]) -> bool:
+    action = str(row.get("action") or "").strip()
+    return bool(row.get("flagged") or row.get("auto_banned") or action in CONTENT_MODERATION_ALERT_ACTIONS)
+
+
+def build_content_moderation_message(rows: list[dict[str, Any]], cfg: Config) -> str:
+    flagged = sum(1 for row in rows if row.get("flagged"))
+    blocked = sum(1 for row in rows if content_moderation_action_blocks(row))
+    auto_banned = sum(1 for row in rows if row.get("auto_banned"))
+    lines = [
+        "🚨 <b>sub2api 风控触发</b>",
+        muted(now_iso(cfg.tzinfo())),
+        h(f"新增 {len(rows)} 条 / 命中 {flagged} / 拦截 {blocked} / 自动封禁 {auto_banned}"),
+        "",
+        section("风控明细"),
+    ]
+    for row in rows[: cfg.detail_limit]:
+        lines.append(format_content_moderation_row(row, cfg))
+    if len(rows) > cfg.detail_limit:
+        lines.append(muted(f"另有 {len(rows) - cfg.detail_limit} 条风控触发未展开"))
+    return clamp_message("\n".join(lines))
+
+
+def format_content_moderation_row(row: dict[str, Any], cfg: Config) -> str:
+    icon = "⛔" if row.get("auto_banned") else ("🚫" if content_moderation_action_blocks(row) else "⚠️")
+    user_bits = ["用户"]
+    user_id = row.get("user_id")
+    if user_id not in (None, ""):
+        user_bits.append(f"#{user_id}")
+    user_label = display_identifier({"email": row.get("user_email")}, cfg)
+    if user_label:
+        user_bits.append(user_label)
+    elif len(user_bits) == 1:
+        user_bits.append("未知")
+    head = f"{icon} " + h(" ".join(user_bits))
+    api_key = truncate(str(row.get("api_key_name") or ""), 48)
+    if api_key:
+        head += f" {h('· API Key：' + api_key)}"
+
+    lines = [head]
+    context_parts = []
+    group = truncate(str(row.get("group_name") or ""), 48)
+    if group:
+        context_parts.append(f"分组：{group}")
+    provider_model = "/".join(part for part in [str(row.get("provider") or ""), str(row.get("model") or "")] if part)
+    if provider_model:
+        context_parts.append(f"模型：{truncate(provider_model, 72)}")
+    endpoint = str(row.get("endpoint") or "")
+    if endpoint and not provider_model:
+        context_parts.append(f"端点：{truncate(endpoint, 48)}")
+    if context_parts:
+        lines.append("  " + h(" · ".join(context_parts)))
+
+    detail_parts = [f"动作：{content_moderation_action_label(row)}"]
+    category = str(row.get("highest_category") or "").strip()
+    if category:
+        detail_parts.append(f"类别：{category}")
+    score = fmt_content_moderation_score(row.get("highest_score"))
+    if score:
+        detail_parts.append(f"分数：{score}")
+    lines.append("  " + h(" · ".join(detail_parts)))
+
+    status_parts = [
+        f"次数：{fmt_int(row.get('violation_count'))}",
+        f"自动封禁：{'是' if row.get('auto_banned') else '否'}",
+        f"邮件：{'已发' if row.get('email_sent') else '未发'}",
+    ]
+    lines.append("  " + h(" / ".join(status_parts)))
+
+    excerpt = truncate(redact_audit_text(str(row.get("input_excerpt") or "").strip(), cfg), 160)
+    if excerpt:
+        lines.append("  " + h(f"摘要：{excerpt}"))
+    error = truncate(str(row.get("error") or "").strip(), 140)
+    if error:
+        lines.append("  " + h(f"错误：{error}"))
+    created = short_time(row.get("created_at"))
+    if created and created != "-":
+        lines.append("  " + muted(f"时间：{created}"))
+    return "\n".join(lines)
+
+
+def content_moderation_action_blocks(row: dict[str, Any]) -> bool:
+    return str(row.get("action") or "") in {"block", "keyword_block", "hash_block"}
+
+
+def content_moderation_action_label(row: dict[str, Any]) -> str:
+    action = str(row.get("action") or "").strip()
+    labels = {
+        "allow": "审计命中",
+        "block": "拦截",
+        "keyword_block": "关键词拦截",
+        "hash_block": "历史命中拦截",
+        "error": "审计异常",
+    }
+    return labels.get(action, action or "未知")
+
+
+def fmt_content_moderation_score(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    text = fmt_amount(value)
+    return text
+
+
+def settings_audit_spec_by_table() -> dict[str, SettingsAuditSpec]:
+    specs = [
+        SettingsAuditSpec(
+            "accounts",
+            "账号管理",
+            "账号",
+            label_fields=("name", "email", "platform", "type"),
+            ignored_fields=(
+                "last_used_at",
+                "error_message",
+                "rate_limited_at",
+                "rate_limit_reset_at",
+                "overload_until",
+                "temp_unschedulable_until",
+                "temp_unschedulable_reason",
+                "session_window_start",
+                "session_window_end",
+                "session_window_status",
+            ),
+        ),
+        SettingsAuditSpec("account_groups", "账号管理", "账号分组关系", identity_fields=("account_id", "group_id"), label_fields=("account_id", "group_id")),
+        SettingsAuditSpec("proxies", "账号管理", "代理", label_fields=("name", "protocol"), sensitive_fields=("host", "password", "username")),
+        SettingsAuditSpec("tls_fingerprint_profiles", "账号管理", "TLS 指纹模板", label_fields=("name",)),
+        SettingsAuditSpec("groups", "订阅管理", "分组/订阅类型", label_fields=("name", "platform", "subscription_type")),
+        SettingsAuditSpec("subscription_plans", "订阅管理", "订阅套餐", label_fields=("name", "product_name", "group_id")),
+        SettingsAuditSpec(
+            "user_subscriptions",
+            "订阅管理",
+            "用户订阅",
+            label_fields=("user_id", "group_id", "status"),
+            ignored_fields=("daily_usage_usd", "weekly_usage_usd", "monthly_usage_usd", "daily_window_start", "weekly_window_start", "monthly_window_start"),
+        ),
+        SettingsAuditSpec("redeem_codes", "订阅管理", "兑换码", label_fields=("type", "group_id"), sensitive_fields=("code",)),
+        SettingsAuditSpec("promo_codes", "订阅管理", "优惠码", label_fields=("status",), ignored_fields=("used_count",), sensitive_fields=("code",)),
+        SettingsAuditSpec("payment_provider_instances", "订阅管理", "支付通道", label_fields=("name", "provider_key", "payment_mode"), sensitive_fields=("config",)),
+        SettingsAuditSpec(
+            "users",
+            "用户管理",
+            "用户",
+            label_fields=("email", "username"),
+            ignored_fields=("balance", "total_recharged", "last_login_at", "last_active_at"),
+            sensitive_fields=("password_hash", "totp_secret_encrypted"),
+        ),
+        SettingsAuditSpec(
+            "api_keys",
+            "用户管理",
+            "API Key",
+            label_fields=("name", "user_id", "group_id"),
+            ignored_fields=("last_used_at", "quota_used", "usage_5h", "usage_1d", "usage_7d", "window_5h_start", "window_1d_start", "window_7d_start"),
+            sensitive_fields=("key",),
+        ),
+        SettingsAuditSpec("user_allowed_groups", "用户管理", "用户分组权限", identity_fields=("user_id", "group_id"), label_fields=("user_id", "group_id")),
+        SettingsAuditSpec("user_attribute_definitions", "用户管理", "用户字段", label_fields=("name", "key")),
+        SettingsAuditSpec("user_attribute_values", "用户管理", "用户字段值", label_fields=("user_id", "attribute_id"), sensitive_fields=("value",)),
+        SettingsAuditSpec(
+            "user_platform_quotas",
+            "用户管理",
+            "用户平台额度",
+            label_fields=("user_id", "platform"),
+            ignored_fields=("daily_usage_usd", "weekly_usage_usd", "monthly_usage_usd", "daily_window_start", "weekly_window_start", "monthly_window_start"),
+        ),
+        SettingsAuditSpec("settings", "系统设置", "系统设置", identity_fields=("key",), label_fields=("key",), sensitive_fields=("value",)),
+        SettingsAuditSpec("announcements", "系统设置", "公告", label_fields=("title",)),
+        SettingsAuditSpec("channel_monitors", "系统设置", "渠道监控", label_fields=("name", "provider", "primary_model"), ignored_fields=("last_checked_at",), sensitive_fields=("api_key_encrypted",)),
+        SettingsAuditSpec("channel_monitor_request_templates", "系统设置", "渠道监控模板", label_fields=("name", "provider", "api_mode")),
+        SettingsAuditSpec("error_passthrough_rules", "系统设置", "错误透传规则", label_fields=("name",)),
+        SettingsAuditSpec("security_secrets", "系统设置", "安全密钥", label_fields=("key",), sensitive_fields=("value",)),
+        SettingsAuditSpec("usage_cleanup_tasks", "系统设置", "用量清理任务", label_fields=("name", "status")),
+    ]
+    return {spec.table: spec for spec in specs}
+
+
+def settings_audit_identity_fields(spec: SettingsAuditSpec, columns: set[str]) -> tuple[str, ...]:
+    if set(spec.identity_fields).issubset(columns):
+        return spec.identity_fields
+    for candidate in (("id",), ("key",), ("name",), ("code",), ("user_id", "group_id"), ("account_id", "group_id")):
+        if set(candidate).issubset(columns):
+            return candidate
+    return ()
+
+
+def settings_audit_snapshot(spec: SettingsAuditSpec, row: dict[str, Any]) -> dict[str, Any]:
+    identity_fields = tuple(field for field in spec.identity_fields if field in row)
+    if not identity_fields:
+        identity_fields = tuple(field for field in ("id", "key", "name", "code") if field in row)[:1]
+    record_id = "|".join(str(row.get(field) or "") for field in identity_fields) or stable_hash(canonical_audit_json(row))
+    values: dict[str, Any] = {}
+    ignored = set(SETTINGS_AUDIT_COMMON_IGNORED_FIELDS) | set(spec.ignored_fields)
+    for field, value in sorted(row.items()):
+        if field in ignored:
+            continue
+        values[field] = normalize_audit_value(field, value, spec)
+    fingerprint = stable_hash(canonical_audit_json(values))
+    return {
+        "id": record_id,
+        "label": settings_audit_record_label(spec, row, record_id),
+        "values": values,
+        "fingerprint": fingerprint,
+    }
+
+
+def settings_audit_change(
+    table: str,
+    spec: SettingsAuditSpec,
+    operation: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+    changed_fields: list[str] | None = None,
+) -> dict[str, Any]:
+    snapshot = after or before or {}
+    return {
+        "table": table,
+        "category": spec.category,
+        "record_label": snapshot.get("label") or spec.label,
+        "operation": operation,
+        "before": before,
+        "after": after,
+        "changed_fields": changed_fields or [],
+    }
+
+
+def settings_audit_record_sort_key(value: str) -> tuple[int, str]:
+    try:
+        return (0, f"{int(value):020d}")
+    except Exception:
+        return (1, value)
+
+
+def settings_audit_record_label(spec: SettingsAuditSpec, row: dict[str, Any], record_id: str) -> str:
+    parts = [spec.label]
+    if record_id:
+        if "|" in record_id:
+            parts.append(record_id.replace("|", "→"))
+        elif not str(record_id).startswith("#"):
+            parts.append(f"#{record_id}" if record_id.isdigit() else str(record_id))
+        else:
+            parts.append(str(record_id))
+    for field in spec.label_fields:
+        if field not in row:
+            continue
+        if field in spec.sensitive_fields or settings_audit_field_sensitive(field):
+            continue
+        value = row.get(field)
+        if value in (None, ""):
+            continue
+        text = truncate(format_plain_audit_scalar(value), 48)
+        if text and text not in parts:
+            parts.append(text)
+            break
+    return " ".join(parts)
+
+
+def normalize_audit_value(field: str, value: Any, spec: SettingsAuditSpec | None = None) -> Any:
+    if settings_audit_value_sensitive(field, spec):
+        return sensitive_audit_value(value)
+    if isinstance(value, dict):
+        return {
+            str(k): normalize_audit_value(str(k), v, spec)
+            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+            if not audit_json_key_ignored(field, str(k))
+        }
+    if isinstance(value, list):
+        return [normalize_audit_value(field, item, spec) for item in value]
+    if isinstance(value, tuple):
+        return [normalize_audit_value(field, item, spec) for item in value]
+    return value
+
+
+def settings_audit_value_sensitive(field: str, spec: SettingsAuditSpec | None = None) -> bool:
+    return bool((spec and field in spec.sensitive_fields) or settings_audit_field_sensitive(field))
+
+
+def settings_audit_field_sensitive(field: str) -> bool:
+    if str(field) in {"credentials", "extra", "extra_headers", "body_override", "provider_snapshot"}:
+        return False
+    return bool(SETTINGS_AUDIT_SENSITIVE_RE.search(str(field)))
+
+
+def audit_json_key_ignored(parent_field: str, key: str) -> bool:
+    key_l = key.lower()
+    parent_l = parent_field.lower()
+    if key_l in {
+        "access_token",
+        "id_token",
+        "expires_at",
+        "expires_in",
+        "expiry",
+        "token_expires_at",
+        "token_expiry",
+        "last_refresh_at",
+        "last_refreshed_at",
+        "updated_at",
+        "last_updated_at",
+        "last_used_at",
+        "last_checked_at",
+        "last_probe_at",
+    }:
+        return True
+    if parent_l == "extra" and (
+        key_l.startswith("codex_") and (
+            key_l.endswith("_used_percent")
+            or key_l.endswith("_reset_at")
+            or key_l in {"codex_usage_updated_at"}
+        )
+    ):
+        return True
+    if key_l.endswith("_synced_at"):
+        return True
+    return False
+
+
+def sensitive_audit_value(value: Any) -> dict[str, Any]:
+    present = value not in (None, "", {}, [])
+    return {
+        "__sensitive__": True,
+        "present": bool(present),
+        "hash": stable_hash(canonical_audit_json(value)) if present else "",
+    }
+
+
+def audit_value_is_sensitive(value: Any) -> bool:
+    return isinstance(value, dict) and bool(value.get("__sensitive__"))
+
+
+def audit_value_contains_sensitive(value: Any) -> bool:
+    if audit_value_is_sensitive(value):
+        return True
+    if isinstance(value, dict):
+        return any(audit_value_contains_sensitive(v) for v in value.values())
+    if isinstance(value, list):
+        return any(audit_value_contains_sensitive(v) for v in value)
+    return False
+
+
+def audit_changed_fields(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    before_values = before.get("values") or {}
+    after_values = after.get("values") or {}
+    fields = sorted(set(before_values.keys()) | set(after_values.keys()))
+    return [field for field in fields if before_values.get(field) != after_values.get(field)]
+
+
+SETTINGS_AUDIT_FIELD_LABELS = {
+    "account_id": "账号ID",
+    "allow_user_refund": "允许用户退款",
+    "api_key_encrypted": "API Key",
+    "auto_pause_on_expired": "过期自动暂停",
+    "body_override": "请求体覆盖",
+    "body_override_mode": "请求体模式",
+    "code": "兑换码",
+    "concurrency": "并发",
+    "config": "配置",
+    "credentials": "凭证",
+    "daily_limit_usd": "日额度",
+    "default_validity_days": "默认有效期",
+    "description": "描述",
+    "email": "邮箱",
+    "enabled": "启用",
+    "expires_at": "过期时间",
+    "extra": "扩展配置",
+    "features": "权益说明",
+    "for_sale": "在售",
+    "group_id": "分组ID",
+    "host": "主机",
+    "ip_blacklist": "IP 黑名单",
+    "ip_whitelist": "IP 白名单",
+    "key": "键",
+    "limits": "限制",
+    "monthly_limit_usd": "月额度",
+    "name": "名称",
+    "notes": "备注",
+    "password_hash": "密码",
+    "payment_mode": "支付模式",
+    "platform": "平台",
+    "port": "端口",
+    "protocol": "协议",
+    "price": "价格",
+    "priority": "优先级",
+    "product_name": "商品名",
+    "provider_key": "支付服务商",
+    "rate_limit_1d": "1d 限额",
+    "rate_limit_5h": "5h 限额",
+    "rate_limit_7d": "7d 限额",
+    "rate_multiplier": "倍率",
+    "refund_enabled": "允许退款",
+    "role": "角色",
+    "rpm_limit": "RPM 上限",
+    "schedulable": "可调度",
+    "sort_order": "排序",
+    "status": "状态",
+    "subscription_type": "订阅类型",
+    "supported_types": "支持类型",
+    "type": "类型",
+    "user_id": "用户ID",
+    "username": "用户名",
+    "validity_days": "有效天数",
+    "validity_unit": "有效期单位",
+    "value": "设置值",
+    "weekly_limit_usd": "周额度",
+}
+
+
+def settings_audit_field_label(field: str) -> str:
+    return SETTINGS_AUDIT_FIELD_LABELS.get(field, field.replace("_", " "))
+
+
+def build_settings_change_message(changes: list[dict[str, Any]], cfg: Config) -> str:
+    category_counts: dict[str, int] = {}
+    for change in changes:
+        category = str(change.get("category") or "其他设置")
+        category_counts[category] = category_counts.get(category, 0) + 1
+    summary = " / ".join(f"{category}{count}" for category, count in category_counts.items())
+    lines = [
+        "🛠️ <b>sub2api 设置变更</b>",
+        muted(now_iso(cfg.tzinfo())),
+        h(f"本次检测到 {len(changes)} 条后台配置改动" + (f"：{summary}" if summary else "")),
+    ]
+
+    shown_total = 0
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for change in changes:
+        grouped.setdefault(str(change.get("category") or "其他设置"), []).append(change)
+
+    for category, category_changes in grouped.items():
+        lines += ["", section(category)]
+        for change in category_changes[: cfg.detail_limit]:
+            lines.append(format_settings_change_row(change, cfg))
+            shown_total += 1
+        if len(category_changes) > cfg.detail_limit:
+            lines.append(muted(f"另有 {len(category_changes) - cfg.detail_limit} 条{category}改动未展开"))
+
+    if len(changes) > shown_total:
+        lines.append(muted(f"合计另有 {len(changes) - shown_total} 条改动未展开"))
+    return clamp_message("\n".join(lines))
+
+
+def format_settings_change_row(change: dict[str, Any], cfg: Config) -> str:
+    operation = str(change.get("operation") or "changed")
+    icon = {"added": "➕", "removed": "➖", "changed": "🔄"}.get(operation, "🔄")
+    action = {"added": "新增", "removed": "移除", "changed": "修改"}.get(operation, "修改")
+    label = redact_audit_text(str(change.get("record_label") or ""), cfg)
+    head = f"{icon} {h(action)} {h(label)}"
+    if operation == "changed":
+        details = format_settings_changed_fields(change.get("before") or {}, change.get("after") or {}, change.get("changed_fields") or [], cfg)
+    else:
+        snapshot = change.get("after") if operation == "added" else change.get("before")
+        details = format_settings_snapshot_fields(snapshot or {}, cfg)
+    if not details:
+        return head
+    return head + "\n  " + "\n  ".join(details)
+
+
+def format_settings_changed_fields(before: dict[str, Any], after: dict[str, Any], fields: list[str], cfg: Config) -> list[str]:
+    before_values = before.get("values") or {}
+    after_values = after.get("values") or {}
+    lines: list[str] = []
+    for field in fields[:SETTINGS_AUDIT_MAX_FIELD_DIFFS]:
+        old = before_values.get(field)
+        new = after_values.get(field)
+        label = settings_audit_field_label(field)
+        if audit_value_is_sensitive(old) or audit_value_is_sensitive(new) or audit_value_contains_sensitive(old) or audit_value_contains_sensitive(new):
+            lines.append(h(format_sensitive_audit_change(label, old, new)))
+        else:
+            lines.append(
+                f"{h(label)}：{h(format_audit_value(old, cfg))} {h('→')} {h(format_audit_value(new, cfg))}"
+            )
+    if len(fields) > SETTINGS_AUDIT_MAX_FIELD_DIFFS:
+        lines.append(muted(f"另有 {len(fields) - SETTINGS_AUDIT_MAX_FIELD_DIFFS} 个字段变化"))
+    return lines
+
+
+def format_settings_snapshot_fields(snapshot: dict[str, Any], cfg: Config) -> list[str]:
+    values = snapshot.get("values") or {}
+    useful_fields = [
+        field for field, value in values.items()
+        if field not in {"id"} and value not in (None, "", [], {})
+    ]
+    lines: list[str] = []
+    for field in useful_fields[:SETTINGS_AUDIT_MAX_FIELD_DIFFS]:
+        value = values[field]
+        label = settings_audit_field_label(field)
+        if audit_value_is_sensitive(value):
+            lines.append(h(f"{label}：{format_sensitive_audit_presence(value)}"))
+        else:
+            lines.append(f"{h(label)}：{h(format_audit_value(value, cfg))}")
+    if len(useful_fields) > SETTINGS_AUDIT_MAX_FIELD_DIFFS:
+        lines.append(muted(f"另有 {len(useful_fields) - SETTINGS_AUDIT_MAX_FIELD_DIFFS} 个字段"))
+    return lines
+
+
+def format_sensitive_audit_change(label: str, old: Any, new: Any) -> str:
+    old_present = bool(old.get("present")) if audit_value_is_sensitive(old) else old not in (None, "", {}, [])
+    new_present = bool(new.get("present")) if audit_value_is_sensitive(new) else new not in (None, "", {}, [])
+    old_hash = str(old.get("hash") or "") if audit_value_is_sensitive(old) else ""
+    new_hash = str(new.get("hash") or "") if audit_value_is_sensitive(new) else ""
+    if old_present and new_present and old_hash and new_hash and old_hash != new_hash:
+        return f"{label}：已更新"
+    if not old_present and new_present:
+        return f"{label}：未设置 → 已设置"
+    if old_present and not new_present:
+        return f"{label}：已设置 → 已清空"
+    return f"{label}：已更新"
+
+
+def format_sensitive_audit_presence(value: Any) -> str:
+    if audit_value_is_sensitive(value):
+        return "已设置" if value.get("present") else "未设置"
+    return "已设置" if value not in (None, "", {}, []) else "未设置"
+
+
+def format_audit_value(value: Any, cfg: Config) -> str:
+    if audit_value_is_sensitive(value):
+        return format_sensitive_audit_presence(value)
+    if value is None:
+        return "空"
+    if value == "":
+        return "空"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (dict, list)):
+        text = canonical_audit_json(reveal_sensitive_markers(value))
+    else:
+        text = format_plain_audit_scalar(value)
+    text = redact_audit_text(text, cfg)
+    return truncate(text, 120)
+
+
+def reveal_sensitive_markers(value: Any) -> Any:
+    if audit_value_is_sensitive(value):
+        return "已设置" if value.get("present") else "未设置"
+    if isinstance(value, dict):
+        return {k: reveal_sensitive_markers(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [reveal_sensitive_markers(v) for v in value]
+    return value
+
+
+def format_plain_audit_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if value is None:
+        return "空"
+    return str(value)
+
+
+def redact_audit_text(text: str, cfg: Config) -> str:
+    if not cfg.redact_identifiers:
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        left = match.group(1)
+        domain = match.group(2)
+        return f"{left[:2]}***@{domain[:2]}***"
+
+    return SETTINGS_AUDIT_EMAIL_RE.sub(repl, text)
+
+
+def canonical_audit_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        return json.dumps(str(value), ensure_ascii=False)
 
 
 def summarize_accounts(rows: list[dict[str, Any]]) -> tuple[list[str], dict[tuple[str, str], dict[str, int]]]:
@@ -2410,7 +3237,7 @@ def parse_allowed_status(spec: str) -> list[tuple[int, int]]:
                 ranges.append((n, n))
             except ValueError:
                 continue
-    return ranges or [(429, 429), (500, 599)]
+    return ranges or [(400, 400), (429, 429), (500, 599)]
 
 
 def status_allowed(status: Any, ranges: list[tuple[int, int]]) -> bool:
@@ -2959,7 +3786,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verbose", action="store_true", help="debug logging")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("daemon", help="run monitor loop")
-    once = sub.add_parser("run-once", help="run account + upstream checks once")
+    once = sub.add_parser("run-once", help="run account + settings + risk-control + recharge + upstream checks once")
     once.add_argument("--notify", action="store_true", help="send Telegram if there are messages")
     once.add_argument("--no-daily", action="store_true", help="skip daily report scheduler")
     account = sub.add_parser("account-summary", help="print/send current account summary")
@@ -3026,6 +3853,12 @@ def main(argv: list[str] | None = None) -> int:
             "postgres_db": cfg.postgres_db,
             "state_file": cfg.state_file,
             "account_summary": summary_lines,
+            "settings_change_alerts_enabled": cfg.settings_change_alerts_enabled,
+            "settings_changes_initialized": mon.state.get("settings_changes_initialized"),
+            "settings_change_tables": cfg.settings_change_tables,
+            "risk_control_alerts_enabled": cfg.risk_control_alerts_enabled,
+            "content_moderation_logs_initialized": mon.state.get("content_moderation_logs_initialized"),
+            "last_content_moderation_log_id": mon.state.get("last_content_moderation_log_id"),
             "user_recharge_alerts_enabled": cfg.user_recharge_alerts_enabled,
             "user_recharges_initialized": mon.state.get("user_recharges_initialized"),
             "recharge_events_initialized": mon.state.get("recharge_events_initialized"),
